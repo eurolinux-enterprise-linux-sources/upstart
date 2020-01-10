@@ -1,0 +1,43 @@
+diff --git a/init/job_process.c b/init/job_process.c
+index c2c96cb..76509d3 100644
+--- a/init/job_process.c
++++ b/init/job_process.c
+@@ -370,7 +370,7 @@ job_process_spawn (JobClass     *class,
+ {
+ 	sigset_t       child_set, orig_set;
+ 	pid_t          pid;
+-	int            i, fds[2];
++	int            i, fds[2], c=0;
+ 	char           filename[PATH_MAX];
+ 	FILE          *fd;
+ 	struct utmpx   utmp;
+@@ -441,8 +441,27 @@ job_process_spawn (JobClass     *class,
+ 	 * the FD_CLOEXEC flag so it's automatically closed when we exec()
+ 	 * later.
+ 	 */
+-	if (system_setup_console (class->console, FALSE) < 0)
+-		job_process_error_abort (fds[1], JOB_PROCESS_ERROR_CONSOLE, 0);
++	while (system_setup_console (class->console, FALSE) < 0) {
++		if (class->console == CONSOLE_OUTPUT ||
++		    class->console == CONSOLE_OWNER) {
++			NihError *err;
++
++			err = nih_error_get ();
++
++			if (c < 20) {
++				nih_warn (_("Failed to open system console, retrying: %s"),
++				  err->message);
++				usleep(50000);
++				c++;
++			} else {
++				nih_warn (_("Failed to open system console, falling back to /dev/null: %s"),
++				  err->message);
++				class->console = CONSOLE_NONE;
++			}
++			nih_free (err);
++		} else
++			job_process_error_abort (fds[1], JOB_PROCESS_ERROR_CONSOLE, 0);
++	}
+ 
+ 	/* Set resource limits for the process, skipping over any that
+ 	 * aren't set in the job class such that they inherit from

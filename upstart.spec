@@ -1,6 +1,6 @@
 Name:           upstart
 Version:        0.6.5
-Release:        12%{?dist}.1
+Release:        13%{?dist}.2
 Summary:        An event-driven init system
 
 Group:          System Environment/Base
@@ -30,6 +30,8 @@ Patch10:	upstart-0.6.5-usage.patch
 Patch11:        upstart-0.6.5-mount.patch
 # reset console to defaults for console owners
 Patch12:        upstart-0.6.5-echo.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=1016124
+Patch13:        upstart-0.6.5-console.patch
 
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 Obsoletes: SysVinit < 2.86-24, sysvinit < 2.86-24
@@ -56,6 +58,7 @@ during shutdown and supervising them while the system is running.
 %patch10 -p1 -b .usage
 %patch11 -p0 -b .mount
 %patch12 -p1 -b .echo
+%patch13 -p1 -b .console
 
 
 %build
@@ -134,7 +137,13 @@ rm -rf %{buildroot}
 %{_mandir}/man8/reload.8.gz
 
 %changelog
-* Mon May 27 2013 Lukas Nykryn <lnykryn@redhat.com> - 0.6.5-12.1
+* Tue Feb 18 2014 Lukáš Nykrýn <lnykryn@redhat.com> - 0.6.5-13.2
+- fix issue with multiple nih_error_raise calls in previous patch
+
+* Fri Feb 07 2014 Lukáš Nykrýn <lnykryn@redhat.com> - 0.6.5-13.1
+- handle open failures on the system console and null
+
+* Mon May 27 2013 Lukas Nykryn <lnykryn@redhat.com> - 0.6.5-13
 - reset console to defaults for console owners (#746801)
 
 * Fri Mar 16 2012 Lukas Nykryn <lnykryn@redhat.com> 0.6.5-12
