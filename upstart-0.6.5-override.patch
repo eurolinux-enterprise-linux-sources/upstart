@@ -1,0 +1,5099 @@
+diff --git a/init/conf.c b/init/conf.c
+index 8c92939..215effa 100644
+--- a/init/conf.c
++++ b/init/conf.c
+@@ -48,7 +48,7 @@
+ #include "parse_conf.h"
+ #include "conf.h"
+ #include "errors.h"
+-
++#include "paths.h"
+ 
+ /* Prototypes for static functions */
+ static int  conf_source_reload_file    (ConfSource *source)
+@@ -70,9 +70,19 @@ static int  conf_file_visitor          (ConfSource *source,
+ 					struct stat *statbuf)
+ 	__attribute__ ((warn_unused_result));
+ 
+-static int  conf_reload_path           (ConfSource *source, const char *path)
++static int  conf_reload_path           (ConfSource *source, const char *path,
++					const char *override_path)
++	__attribute__ ((warn_unused_result));
++
++static inline int  is_conf_file        (const char *path)
+ 	__attribute__ ((warn_unused_result));
+ 
++static inline int is_conf_file_std     (const char *path)
++	__attribute__ ((warn_unused_result));
++
++static inline int
++is_conf_file_override                  (const char *path)
++	__attribute__ ((warn_unused_result));
+ 
+ /**
+  * conf_sources:
+@@ -85,6 +95,115 @@ NihList *conf_sources = NULL;
+ 
+ 
+ /**
++ * is_conf_file_std:
++ * @path: path to check.
++ *
++ * Determine if specified path contains a legitimate
++ * configuration file name.
++ *
++ * Returns: TRUE if @path contains a valid configuration file name,
++ * else FALSE.
++ *
++ **/
++static inline int
++is_conf_file_std (const char *path)
++{
++	char *ptr = strrchr (path, '.');
++
++	if (ptr && IS_CONF_EXT_STD (ptr))
++		return TRUE;
++
++	return FALSE;
++}
++
++/**
++ * is_conf_file_override:
++ * @path: path to check.
++ *
++ * Determine if specified path contains a legitimate
++ * override file name.
++ *
++ * Returns: TRUE if @path contains a valid override file name,
++ * else FALSE.
++ *
++ **/
++static inline int
++is_conf_file_override (const char *path)
++{
++	char *ptr = strrchr (path, '.');
++
++	if (ptr && IS_CONF_EXT_OVERRIDE (ptr))
++		return TRUE;
++
++	return FALSE;
++}
++
++/**
++ * is_conf_file:
++ * @path: path to check.
++ *
++ * Determine if specified path contains a legitimate
++ * configuration file or override file name.
++ *
++ * Returns: TRUE if @path contains a valid configuration
++ * file or override file name, else FALSE.
++ *
++ **/
++static inline int
++is_conf_file (const char *path)
++{
++	char *ptr = strrchr (path, '.');
++
++	if (ptr && (ptr > path) && (ptr[-1] != '/') && IS_CONF_EXT (ptr))
++		return TRUE;
++
++	return FALSE;
++}
++
++/**
++ * Convert a configuration file name to an override file name and vice
++ * versa.
++ *
++ * For example, if @path is "foo.conf", this function will return
++ * "foo.override", whereas if @path is "foo.override", it will return
++ * "foo.conf".
++ *
++ * Note that this function should be static, but isn't to allow the
++ * tests to access it.
++ *
++ * @parent: parent of returned path,
++ * @path: path to a configuration file.
++ *
++ * Returns: newly allocated toggled path, or NULL on error.
++ **/
++char *
++toggle_conf_name (const void     *parent,
++		 const char     *path)
++{
++	char *new_path;
++	char *ext;
++	char *new_ext;
++	size_t len;
++
++	ext = strrchr (path, '.');
++	if (!ext)
++		return NULL;
++
++	new_ext = IS_CONF_EXT_STD (ext)
++		? CONF_EXT_OVERRIDE
++		: CONF_EXT_STD;
++
++	len = strlen (new_ext);
++
++	new_path = NIH_MUST (nih_strndup (parent, path, (ext - path) + len));
++
++	memcpy (new_path + (ext - path), new_ext, len);
++
++	return new_path;
++}
++
++
++/**
+  * conf_init:
+  *
+  * Initialise the conf_sources list.
+@@ -232,10 +351,9 @@ conf_reload (void)
+ 			NihError *err;
+ 
+ 			err = nih_error_get ();
+-			if (err->number != ENOENT)
+-				nih_error ("%s: %s: %s", source->path,
+-					   _("Unable to load configuration"),
+-					   err->message);
++			nih_error ("%s: %s: %s", source->path,
++					_("Unable to load configuration"),
++					err->message);
+ 			nih_free (err);
+ 		}
+ 	}
+@@ -328,10 +446,16 @@ static int
+ conf_source_reload_file (ConfSource *source)
+ {
+ 	NihError *err = NULL;
++	nih_local char *override_path = NULL;
++
++	struct stat statbuf;
+ 
+ 	nih_assert (source != NULL);
+ 	nih_assert (source->type == CONF_FILE);
+ 
++	/* this function should only be called for standard
++	 * configuration files.
++	 */
+ 	if (! source->watch) {
+ 		nih_local char *dpath = NULL;
+ 		char           *dname;
+@@ -360,7 +484,7 @@ conf_source_reload_file (ConfSource *source)
+ 	/* Parse the file itself.  If this fails, then we can discard the
+ 	 * inotify error, since this one will be better.
+ 	 */
+-	if (conf_reload_path (source, source->path) < 0) {
++	if (conf_reload_path (source, source->path, NULL) < 0) {
+ 		if (err)
+ 			nih_free (err);
+ 
+@@ -381,6 +505,26 @@ conf_source_reload_file (ConfSource *source)
+ 		nih_free (err);
+ 	}
+ 
++	if (! is_conf_file_std (source->path))
++		return 0;
++
++	override_path = toggle_conf_name (NULL, source->path);
++
++	if (stat (override_path, &statbuf) != 0)
++		return 0;
++
++	nih_debug ("Updating configuration for %s from %s",
++		  source->path, override_path);
++	if (conf_reload_path (source, source->path, override_path) < 0) {
++		NihError *err;
++
++		err = nih_error_get ();
++		nih_error ("%s: %s: %s", override_path,
++				_("Error while reloading configuration file"),
++				err->message);
++		nih_free (err);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -500,19 +644,18 @@ conf_file_filter (ConfSource *source,
+  * @is_dir: TRUE of @path is a directory.
+  *
+  * This is the file filter used for the jobs directory, we only care
+- * about paths with the ".conf" extension.  Directories that
+- * match the nih_file_ignore() function are also ignored.
++ * about paths with particular extensions (see IS_CONF_EXT).
++ *
++ * Directories that match the nih_file_ignore() function are also ignored.
+  *
+- * Returns: FALSE if @path ends in ".conf", or is the original source,
+- * TRUE otherwise.
++ * Returns: FALSE if @path ends in ".conf" or ".override",
++ * or is the original source, TRUE otherwise.
+  **/
+ static int
+ conf_dir_filter (ConfSource *source,
+ 		 const char *path,
+ 		 int         is_dir)
+ {
+-	char *ptr;
+-
+ 	nih_assert (source != NULL);
+ 	nih_assert (path != NULL);
+ 
+@@ -522,8 +665,7 @@ conf_dir_filter (ConfSource *source,
+ 	if (is_dir)
+ 		return nih_file_ignore (NULL, path);
+ 
+-	ptr = strrchr (path, '.');
+-	if (ptr && (! strcmp (ptr, ".conf")))
++	if (is_conf_file (path))
+ 		return FALSE;
+ 
+ 	return TRUE;
+@@ -545,29 +687,92 @@ conf_dir_filter (ConfSource *source,
+  * After checking that it was a regular file that was changed, we reload it;
+  * we expect this to fail sometimes since the file may be only partially
+  * written.
+-  **/
++ **/
+ static void
+ conf_create_modify_handler (ConfSource  *source,
+ 			    NihWatch    *watch,
+ 			    const char  *path,
+ 			    struct stat *statbuf)
+ {
++	ConfFile *file = NULL;
++	const char *error_path = path;
++	nih_local char *new_path = NULL;
++	int ret;
++
+ 	nih_assert (source != NULL);
+ 	nih_assert (watch != NULL);
+ 	nih_assert (path != NULL);
+ 	nih_assert (statbuf != NULL);
+ 
++	/* note that symbolic links are ignored */
+ 	if (! S_ISREG (statbuf->st_mode))
+ 		return;
+ 
+-	if (conf_reload_path (source, path) < 0) {
++	new_path = toggle_conf_name (NULL, path);
++	file = (ConfFile *)nih_hash_lookup (source->files, new_path);
++
++	if (is_conf_file_override (path)) {
++		if (! file) {
++			/* override file has no corresponding conf file */
++			nih_debug ("Ignoring orphan override file %s", path);
++			return;
++		}
++
++		/* reload conf file */
++		nih_debug ("Loading configuration file %s", new_path);
++		ret = conf_reload_path (source, new_path, NULL);
++		if (ret < 0) {
++			error_path = new_path;
++			goto error;
++		}
++
++		/* overlay override settings */
++		nih_debug ("Loading override file %s for %s", path, new_path);
++		ret = conf_reload_path (source, new_path, path);
++		if (ret < 0) {
++			error_path = path;
++			goto error;
++		}
++	} else {
++		nih_debug ("Loading configuration and override files for %s", path);
++
++		/* load conf file */
++		nih_debug ("Loading configuration file %s", path);
++		ret = conf_reload_path (source, path, NULL);
++		if (ret < 0) {
++			error_path = path;
++			goto error;
++		}
++
++		/* ensure we ignore directory changes (which won't have overrides. */
++		if (is_conf_file_std (path)) {
++			struct stat st;
++			if (stat (new_path, &st) == 0) {
++				/* overlay override settings */
++				nih_debug ("Loading override file %s for %s", new_path, path);
++				ret = conf_reload_path (source, path, new_path);
++				if (ret < 0) {
++					error_path = new_path;
++					goto error;
++				}
++			}
++
++		}
++	}
++
++	return;
++
++error:
++	{
+ 		NihError *err;
+ 
+ 		err = nih_error_get ();
+-		nih_error ("%s: %s: %s", path,
+-			   _("Error while loading configuration file"),
+-			   err->message);
++		nih_error ("%s: %s: %s", error_path,
++				_("Error while loading configuration file"),
++				err->message);
+ 		nih_free (err);
++		if (file)
++			nih_unref (file, source);
+ 	}
+ }
+ 
+@@ -584,13 +789,14 @@ conf_create_modify_handler (ConfSource  *source,
+  *
+  * We lookup the file in our hash table, and if we can find it, perform
+  * the usual deletion of it.
+-  **/
++ **/
+ static void
+ conf_delete_handler (ConfSource *source,
+ 		     NihWatch   *watch,
+ 		     const char *path)
+ {
+ 	ConfFile *file;
++	nih_local char *new_path = NULL;
+ 
+ 	nih_assert (source != NULL);
+ 	nih_assert (watch != NULL);
+@@ -602,7 +808,11 @@ conf_delete_handler (ConfSource *source,
+ 	 * it's probably a directory or something, so just ignore it.
+ 	 */
+ 	file = (ConfFile *)nih_hash_lookup (source->files, path);
+-	if (! file) {
++	/* Note we have to be careful to consider deletion of directories too.
++	 * This is handled implicitly by the override check which will return
++	 * false if passed a directory in this case.
++	 */
++	if (! file && ! is_conf_file_override (path)) {
+ 		if (! strcmp (watch->path, path)) {
+ 			nih_warn ("%s: %s", source->path,
+ 				  _("Configuration directory deleted"));
+@@ -613,7 +823,30 @@ conf_delete_handler (ConfSource *source,
+ 		return;
+ 	}
+ 
+-	nih_unref (file, source);
++	/* non-override files (and directories) are the simple case, so handle
++	 * them and leave.
++	 */ 
++	if (! is_conf_file_override (path)) {
++		nih_unref (file, source);
++		return;
++	}
++
++	/* if an override file is deleted for which there is a corresponding
++	 * conf file, reload the conf file to remove any modifications
++	 * introduced by the override file.
++	 */
++	new_path = toggle_conf_name (NULL, path);
++	file = (ConfFile *)nih_hash_lookup (source->files, new_path);
++
++	if (file) {
++		nih_debug ("Reloading configuration for %s on deletion of overide (%s)",
++				new_path, path);
++
++		if ( conf_reload_path (source, new_path, NULL) < 0 ) {
++			nih_warn ("%s: %s", new_path,
++					_("Unable to reload configuration after override deletion"));
++		}
++	}
+ }
+ 
+ /**
+@@ -636,22 +869,61 @@ conf_file_visitor (ConfSource  *source,
+ 		   const char  *path,
+ 		   struct stat *statbuf)
+ {
++	ConfFile *file = NULL;
++	nih_local char *new_path = NULL;
++
+ 	nih_assert (source != NULL);
+ 	nih_assert (dirname != NULL);
+ 	nih_assert (path != NULL);
+ 	nih_assert (statbuf != NULL);
+ 
++	/* We assume that CONF_EXT_STD files are visited before
++	 * CONF_EXT_OVERRIDE files. Happily, this assumption is currently
++	 * valid since CONF_EXT_STD comes before CONF_EXT_OVERRIDE if ordered
++	 * alphabetically.
++	 *
++	 * If this were ever to change (for example if we decided to
++	 * rename the CONF_EXT_OVERRIDE files to end in ".abc", say), the logic
++	 * in this function would be erroneous since it would never be possible when
++	 * visiting an override file (before a conf file) to lookup a conf file
++	 * in the hash, since the conf file would not yet have been seen and thus would
++	 * not exist in the hash (yet).
++	 */
++	nih_assert (CONF_EXT_STD[1] < CONF_EXT_OVERRIDE[1]);
++
+ 	if (! S_ISREG (statbuf->st_mode))
+ 		return 0;
+ 
+-	if (conf_reload_path (source, path) < 0) {
+-		NihError *err;
++	if (is_conf_file_std (path)) {
++		if (conf_reload_path (source, path, NULL) < 0) {
++			NihError *err;
+ 
+-		err = nih_error_get ();
+-		nih_error ("%s: %s: %s", path,
+-			   _("Error while loading configuration file"),
+-			   err->message);
+-		nih_free (err);
++			err = nih_error_get ();
++			nih_error ("%s: %s: %s", path,
++					_("Error while loading configuration file"),
++					err->message);
++			nih_free (err);
++		}
++		return 0;
++	}
++
++	new_path = toggle_conf_name (NULL, path);
++	file = (ConfFile *)nih_hash_lookup (source->files, new_path);
++
++	if (file) {
++		/* we're visiting an override file with an associated conf file that
++		 * has already been loaded, so just overlay the override file. If
++		 * there is no corresponding conf file, we ignore the override file.
++		 */
++		if (conf_reload_path (source, new_path, path) < 0) {
++			NihError *err;
++
++			err = nih_error_get ();
++			nih_error ("%s: %s: %s", new_path,
++					_("Error while reloading configuration file"),
++					err->message);
++			nih_free (err);
++		}
+ 	}
+ 
+ 	return 0;
+@@ -661,12 +933,15 @@ conf_file_visitor (ConfSource  *source,
+ /**
+  * conf_reload_path:
+  * @source: configuration source,
+- * @path: path of file to be reloaded.
++ * @path: path of conf file to be reloaded.
++ * @override_path: if TRUE and @path refers to a path associated with @source,
++ * overlay the contents of @path into the existing @source entry for
++ * @path. If FALSE, discard any existing knowledge of @path.
+  *
+- * This function is used to parse the file at @path in the context of the
+- * given configuration @source.  Necessary ConfFile structures are allocated
+- * and attached to @source as appropriate.  CONF_FILE sources always have
+- * a single ConfFile when the file exists.
++ * This function is used to parse the file at @path (or @override_path) in the
++ * context of the given configuration @source.  Necessary ConfFile structures
++ * are allocated and attached to @source as appropriate.  CONF_FILE sources
++ * always have a single ConfFile when the file exists.
+  *
+  * If the file has been parsed before, then the existing item is deleted and
+  * freed if the file fails to load, or after the new item has been parsed.
+@@ -678,36 +953,43 @@ conf_file_visitor (ConfSource  *source,
+  **/
+ static int
+ conf_reload_path (ConfSource *source,
+-		  const char *path)
++	  const char *path,
++	  const char *override_path)
+ {
+-	ConfFile       *file;
++	ConfFile       *file = NULL;
+ 	nih_local char *buf = NULL;
+ 	const char     *start, *end;
+ 	nih_local char *name = NULL;
+ 	size_t          len, pos, lineno;
+ 	NihError       *err = NULL;
++	const char     *path_to_load;
+ 
+ 	nih_assert (source != NULL);
+ 	nih_assert (path != NULL);
+ 
+-	/* Look up the old file in memory, and then free it.  In cases
+-	 * of failure, we discard it anyway, so there's no particular reason
++	path_to_load = ( override_path ? override_path : path);
++
++	/* If there is no corresponding override file, look up the old
++	 * conf file in memory, and then free it.  In cases of failure,
++	 * we discard it anyway, so there's no particular reason
+ 	 * to keep it around anymore.
+ 	 */
+ 	file = (ConfFile *)nih_hash_lookup (source->files, path);
+-	if (file)
++	if (! override_path && file)
+ 		nih_unref (file, source);
+ 
+ 	/* Read the file into memory for parsing, if this fails we don't
+ 	 * bother creating a new ConfFile structure for it and bail out
+ 	 * now.
+ 	 */
+-	buf = nih_file_read (NULL, path, &len);
++	buf = nih_file_read (NULL, path_to_load, &len);
+ 	if (! buf)
+ 		return -1;
+ 
+-	/* Parse the file, storing the item in a new ConfFile structure. */
+-	file = NIH_MUST (conf_file_new (source, path));
++	/* Create a new ConfFile structure (if no override_path was specified) */
++	file = (ConfFile *)nih_hash_lookup (source->files, path);
++	if (! file)
++		file = NIH_MUST (conf_file_new (source, path));
+ 
+ 	pos = 0;
+ 	lineno = 1;
+@@ -716,7 +998,14 @@ conf_reload_path (ConfSource *source,
+ 	case CONF_FILE:
+ 	case CONF_DIR:
+ 		/* Simple file of options; usually no item attached to it. */
+-		nih_debug ("Loading configuration from %s", path);
++		if (override_path) {
++			nih_debug ("Updating configuration for %s from %s",
++					path, override_path);
++		} else {
++			nih_debug ("Loading configuration from %s %s",
++					(source->type == CONF_DIR ? "directory" : "file"), path);
++		}
++
+ 		if (parse_conf (file, buf, len, &pos, &lineno) < 0)
+ 			err = nih_error_get ();
+ 
+@@ -734,7 +1023,7 @@ conf_reload_path (ConfSource *source,
+ 			start++;
+ 
+ 		end = strrchr (start, '.');
+-		if (end && (! strcmp (end, ".conf"))) {
++		if (end && IS_CONF_EXT (end)) {
+ 			name = NIH_MUST (nih_strndup (NULL, start, end - start));
+ 		} else {
+ 			name = NIH_MUST (nih_strdup (NULL, start));
+@@ -743,8 +1032,14 @@ conf_reload_path (ConfSource *source,
+ 		/* Create a new job item and parse the buffer to produce
+ 		 * the job definition.
+ 		 */
+-		nih_debug ("Loading %s from %s", name, path);
+-		file->job = parse_job (NULL, name, buf, len, &pos, &lineno);
++		if (override_path) {
++			nih_debug ("Updating %s (%s) with %s",
++					name, path, override_path);
++		} else {
++			nih_debug ("Loading %s from %s", name, path);
++		}
++		file->job = parse_job (NULL, file->job,
++			name, buf, len, &pos, &lineno);
+ 		if (file->job) {
+ 			job_class_consider (file->job);
+ 		} else {
+@@ -778,7 +1073,7 @@ conf_reload_path (ConfSource *source,
+ 		case PARSE_EXPECTED_OPERATOR:
+ 		case PARSE_EXPECTED_VARIABLE:
+ 		case PARSE_MISMATCHED_PARENS:
+-			nih_error ("%s:%zi: %s", path, lineno, err->message);
++			nih_error ("%s:%zi: %s", path_to_load, lineno, err->message);
+ 			nih_free (err);
+ 			err = NULL;
+ 			break;
+@@ -881,3 +1176,149 @@ conf_select_job (const char *name)
+ 
+ 	return NULL;
+ }
++
++#ifdef DEBUG
++
++size_t
++debug_count_list_entries (const NihList *list)
++{
++	size_t i = 0;
++	NIH_LIST_FOREACH (list, iter) {
++		i++;
++	}
++	return i;
++}
++
++size_t
++debug_count_hash_entries (const NihHash *hash)
++{
++	size_t i = 0;
++	NIH_HASH_FOREACH_SAFE (hash, iter) {
++		i++;
++	}
++	return i;
++}
++
++void
++debug_show_job_class (const JobClass *job)
++{
++	int i;
++	char **env    = (char **)job->env;
++	char **export = (char **)job->export;
++
++	nih_assert (job);
++
++	nih_debug ("JobClass %p: name='%s', path='%s', task=%d, "
++			"respawn=%d, console=%x, deleted=%d, debug=%d",
++			job, job->name, job->path, job->task,
++			job->respawn, job->console, job->deleted, job->debug);
++
++	nih_debug ("\tstart_on=%p, stop_on=%p, emits=%p, process=%p",
++			job->start_on, job->stop_on, job->emits, job->process);
++
++	nih_debug ("\tauthor='%s', description='%s'",
++			job->author, job->description);
++
++	if (env && *env) {
++		nih_debug ("\tenv:");
++		i = 0;
++		while ( *env ) {
++			nih_debug ("\t\tenv[%d]='%s' (len=%u+1)",
++					i, *env, strlen (*env));
++			env++;
++			++i;
++		}
++	} else {
++		nih_debug ("\tenv: none.");
++	}
++
++
++	if (export && *export) {
++		nih_debug ("\texport:");
++		i = 0;
++		while ( *export ) {
++			nih_debug ("\t\tenv[%d]='%s' (len=%u+1)",
++					i, *export, strlen (*export));
++			export++;
++			++i;
++		}
++	}
++	else {
++		nih_debug ("\texport: none");
++	}
++}
++
++void
++debug_show_job_classes (void)
++{
++	nih_debug ("job_classes:");
++
++	NIH_HASH_FOREACH_SAFE (job_classes, iter) {
++		JobClass *job = (JobClass *)iter;
++		debug_show_job_class (job);
++	}
++}
++
++void
++debug_show_event (const Event *event)
++{
++	nih_assert (event);
++
++	nih_debug ("Event %p: name='%s', progress=%x, failed=%d, "
++			"blockers=%d, blocking=%p",
++			event, event->name, event->progress, event->failed,
++			event->blockers, (void *)&event->blocking);
++}
++
++void
++debug_show_conf_file (const ConfFile *file)
++{
++	nih_assert (file);
++
++	nih_debug ("ConfFile %p: path='%s', source=%p, flag=%x, job=%p",
++			file, file->path, file->source, file->flag, file->job);
++
++	/* Some ConfFile objects won't have any JobClass details, for example,
++	 * the ConfFile object associated with "/etc/init.conf".
++	 */
++	if (! file->job) {
++		nih_debug ("ConfFile %p: job: no JobClass object.", file);
++		return;
++	}
++
++	nih_debug ("ConfFile %p: job:", file);
++	debug_show_job_class (file->job);
++}
++
++void
++debug_show_conf_source (const ConfSource *source)
++{
++	nih_assert (source);
++
++	nih_debug ("ConfSource %p: path='%s', type=%x, flag=%x",
++			source, source->path, source->type, source->flag);
++
++	nih_debug ("ConfSource %p files (%d):", source,
++			debug_count_hash_entries (source->files));
++
++	NIH_HASH_FOREACH (source->files, file_iter) {
++		ConfFile *file = (ConfFile *)file_iter;
++		debug_show_conf_file (file);
++	}
++}
++
++void
++debug_show_conf_sources (void)
++{
++	nih_assert (conf_sources);
++
++	nih_debug ("conf_sources:");
++
++	NIH_LIST_FOREACH (conf_sources, iter) {
++		ConfSource *source = (ConfSource *)iter;
++		debug_show_conf_source (source);
++	}
++}
++
++#endif /* DEBUG */
++
+diff --git a/init/conf.h b/init/conf.h
+index d6915f3..bac02ac 100644
+--- a/init/conf.h
++++ b/init/conf.h
+@@ -124,6 +124,46 @@ int         conf_file_destroy  (ConfFile *file);
+ 
+ JobClass *  conf_select_job    (const char *name);
+ 
++char *toggle_conf_name         (const void *parent, const char *path)
++	__attribute__ ((warn_unused_result, malloc));
++
++#ifdef DEBUG
++
++/* used for debugging only */
++
++size_t
++debug_count_hash_entries       (const NihHash *hash);
++
++size_t
++debug_count_list_entries       (const NihList *list)
++	__attribute__ ((unused));
++
++void
++debug_show_job_class           (const JobClass *job)
++	__attribute__ ((unused));
++
++void
++debug_show_job_classes         (void)
++	__attribute__ ((unused));
++
++void
++debug_show_event               (const Event *event)
++	__attribute__ ((unused));
++
++void
++debug_show_conf_file(const ConfFile *file)
++	__attribute__ ((unused));
++
++void
++debug_show_conf_source(const ConfSource *source)
++	__attribute__ ((unused));
++
++void
++debug_show_conf_sources(void)
++	__attribute__ ((unused));
++
++#endif
++
+ NIH_END_EXTERN
+ 
+ #endif /* INIT_CONF_H */
+diff --git a/init/man/init.5 b/init/man/init.5
+index 7400662..5260032 100644
+--- a/init/man/init.5
++++ b/init/man/init.5
+@@ -1,10 +1,10 @@
+-.TH init 5 2010-02-04 "Upstart"
++.TH init 5 2011-01-12 "Upstart"
+ .\"
+ .SH NAME
+ init \- Upstart init daemon job configuration
+ .\"
+ .SH SYNOPSIS
+-.B /etc/init
++.B /etc/init/
+ .\"
+ .SH DESCRIPTION
+ On startup, the Upstart
+@@ -14,29 +14,66 @@ daemon reads its job configuration from the
+ directory, and watches for future changes using
+ .BR inotify (7).
+ 
+-Files in this directory must end in
+-.I .conf
+-and may also be present in sub-directories.
++To be considered by Upstart, files in this directory must have a
++recognized suffix and may also be present in sub-directories.  There are
++two recognized suffixes:
+ 
+-Each file defines a single service or task, with the name taken from its
+-relative path within the directory without the extension.  For example a
+-job defined in
++.IP \(bu 4 
++Files ending in
++.I .conf
++are called configuration files, or simply "conf files" for short.
++These are the primary vehicle for specifying a job.
++.IP \(bu 4 
++Files ending in
++.I .override
++are called override files.  If an override file is present, the stanzas
++it contains take precedence over those equivalently named stanzas in the
++corresponding configuration file contents for a particular job.
++The main use for override files is to modify how a job will run without
++having to modify its configuration file directly.  See the section
++\fBOverride File Handling\fP below for further details.
++.P
++A job can thus be defined by either:
++.IP \[bu] 2
++A single configuration file.
++.IP \[bu]
++A single configuration file \fBand\fP a single override file.
++.P
++Unless explicitly stated otherwise, any reference to a jobs
++configuration can refer both to a configuration file or an override
++file.
++
++Each configuration file defines the template for a single \fIservice\fP
++(long-running process or daemon) or \fItask\fP (short-lived process).
++
++Note that a configuration file is not itself a job: it is a description
++of an environmenta job could be run in.  A job is the runtime embodiment
++of a configuration file.
++
++The configuration file name as displayed by Upstart and associated
++tooling is taken from its relative path within the directory without the
++extension.  For example a configuration file
+ .I /etc/init/rc-sysinit.conf
+ is named
+ .IR rc-sysinit ,
+-while a job defined in
++while a configuration file
+ .I /etc/init/net/apache.conf
+ is named
+ .IR net/apache .
++Since override files only modify the way a configuration file is
++interpreted, they are not named.
+ 
+-These files are plain text and should not be executable.
++Configuration files are plain text and should not be executable.
+ .\"
+-.SS Format
++.SS Configuration File Format
+ Each line begins with a configuration stanza and continues until either
+ the end of the line or a line containing a closing stanza.  Line breaks
+ within a stanza are permitted within single or double quotes, or if
+ preceeded by a blackslash.
+ 
++If a stanza is duplicated, the last occurence will be used. Unrecognized
++stanzas will generate parse errors, which will stop a job from running.
++
+ Stanzas and their arguments are delimited by whitespace, which consists
+ of one or more space or tab characters which are otherwise ignored unless
+ placed within single or double quotes.
+@@ -249,7 +286,7 @@ The
+ .B stop on
+ stanza defines the set of events that will cause the job to be automatically
+ stopped.  It has the same syntax as
+-.B start on
++\fBstart on\fP.
+ 
+ .I VALUE
+ may additionally expand the value of any variable that came from the
+@@ -348,7 +385,7 @@ Respawning is subject to a limit, if the job is respawned more than
+ times in
+ .I INTERVAL
+ seconds, it will be considered to be having deeper problems and will
+-be stopped.
++be stopped. Default COUNT is 10. Default INTERVAL is 5 seconds.
+ 
+ This only applies to automatic respawns and not the
+ .BR restart (8)
+@@ -367,7 +404,8 @@ normal exit 0 1 TERM HUP
+ .SS Instances
+ By default, only one instance of any job is permitted to exist at one
+ time.  Attempting to start a job when it's already starting or running
+-results in an error.
++results in an error. Note that a job is considered to be running if its
++pre-start process is running.
+ 
+ Multiple instances may be permitted by defining the names of those
+ instances.  If an instance with the same name is not already starting
+@@ -543,6 +581,46 @@ value, both of which are integers.  The special value
+ .B unlimited
+ may be specified for either.
+ .\"
++.SS Override File Handling
++Override files allow a jobs environment to be changed without modifying
++the jobs configuration file. Rules governing override files:
++
++.IP \[bu] 2
++If a job is embodied with only a configuration file, the contents of
++this file define the job.
++.IP \[bu]
++If an override files exists where there is no existing cofiguration
++file, the override file is ignored.
++.IP \[bu]
++If both a configuration file \fBand\fP an override file exist for a job
++and both files are syntactically correct:
++.RS
++.IP \[bu] 2
++stanzas in the override file will take precedence over stanzas present
++in the corresponding configuration file.
++.IP \[bu]
++stanzas in the override file which are not present in the corresponding
++configuration file will be honoured when the job runs.
++.RE
++.IP \[bu]
++If both a configuration file and an override file exist for a job and
++subsequently the override file is deleted, the configuration file is
++automatically reloaded with the effect that any changes introduced by
++the override file are undone and the configuration file alone now defines
++the job.
++.IP \[bu]
++If both a configuration file and an override file exist for a job and
++subsequently the configuration file is deleted, a new instance of the
++job can no longer be started (since without a corresponding
++configuration file an override file is ignored).
++.IP \[bu]
++If both a configuration file and an override file exist for a job and
++any of the contents of the override file are invalid, the override file
++is ignored and only the contents of the configuration file are
++considered.
++.P
++
++.\"
+ .SS Miscellaneous
+ .TP
+ .B kill timeout \fIINTERVAL
+@@ -550,7 +628,7 @@ Specifies the interval between sending the job's main process the
+ .I SIGTERM
+ and
+ .I SIGKILL
+-signals when stopping the running job.
++signals when stopping the running job. Default is 5 seconds.
+ .\"
+ .TP
+ .B expect stop
+@@ -591,6 +669,48 @@ Without this stanza
+ is unable to supervise forking processes and will believe them to have
+ stopped as soon as they fork on startup.
+ .\"
++.SH BUGS
++The 
++.B and
++and 
++.B or
++operators allowed with
++.B start on
++and
++.B stop on
++do not work intuitively: operands to the right of either operator are
++only evaluated once and state information is then discarded. This can
++lead to jobs with complex \fBstart on\fP or \fPstop on\fP conditions
++not behaving as expected \fIwhen restarted\fP. For example, if a job
++encodes the following condition:
++.ti +4
++.sp 1
++.nf
++start on A and (B or C)
++.fi
++
++When 'A' and 'B' become true, the condition is satisfied so the job will
++be run. However, if the job ends and subsequently 'A' and 'C' become true,
++the job will \fInot\fP be re-run even though the condtion is satisfied.
++Avoid using complex conditions with jobs which need to be restarted.
++.\"
++.SH AUTHOR
++Manual page written by Scott James Remnant
++.RB < scott@netsplit.com >
++and James Hunt
++.RB < james.hunt@canonical.com > .
++.\"
++.SH REPORTING BUGS
++Report bugs at
++.RB < https://launchpad.net/upstart/+bugs >
++.\"
++.SH COPYRIGHT
++Copyright \(co 2010 Canonical Ltd.
++.br
++This is free software; see the source for copying conditions.  There is NO
++warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++
++.\"
+ .SH SEE ALSO
+ .BR init (8)
+ .BR sh (1)
+diff --git a/init/parse_job.c b/init/parse_job.c
+index 29122fa..24aefb6 100644
+--- a/init/parse_job.c
++++ b/init/parse_job.c
+@@ -253,6 +253,7 @@ static NihConfigStanza stanzas[] = {
+ /**
+  * parse_job:
+  * @parent: parent object for new job,
++ * @update: If not NULL, update the existing specified JobClass,
+  * @name: name of new job,
+  * @file: file or string to parse,
+  * @len: length of @file,
+@@ -268,10 +269,12 @@ static NihConfigStanza stanzas[] = {
+  * of the returned job are freed, the returned job will also be
+  * freed.
+  *
+- * Returns: new JobClass structure on success, NULL on raised error.
++ * Returns: if @update is NULL, returns new JobClass structure on success, NULL on raised error.
++ * If @update is not NULL, returns @update or NULL on error.
+  **/
+ JobClass *
+ parse_job (const void *parent,
++	   JobClass   *update,	
+ 	   const char *name,
+ 	   const char *file,
+ 	   size_t      len,
+@@ -284,13 +287,22 @@ parse_job (const void *parent,
+ 	nih_assert (file != NULL);
+ 	nih_assert (pos != NULL);
+ 
+-	class = job_class_new (parent, name);
++	if (update) {
++		class = update;
++		nih_debug ("Reusing JobClass %s (%s)",
++				class->name, class->path);
++	} else {
++		nih_debug ("Creating new JobClass %s",
++				name);
++		class = job_class_new (parent, name);
++	}
+ 	if (! class)
+ 		nih_return_system_error (NULL);
+ 
+ 	if (nih_config_parse_file (file, len, pos, lineno,
+ 				   stanzas, class) < 0) {
+-		nih_free (class);
++		if (!update)
++			nih_free (class);
+ 		return NULL;
+ 	}
+ 
+diff --git a/init/parse_job.h b/init/parse_job.h
+index f98f70c..65a205f 100644
+--- a/init/parse_job.h
++++ b/init/parse_job.h
+@@ -27,8 +27,8 @@
+ 
+ NIH_BEGIN_EXTERN
+ 
+-JobClass *parse_job (const void *parent, const char *name,
+-		     const char *file, size_t len,
++JobClass *parse_job (const void *parent, JobClass *update,
++		     const char *name, const char *file, size_t len,
+ 		     size_t *pos, size_t *lineno)
+ 	__attribute__ ((warn_unused_result, malloc));
+ 
+diff --git a/init/paths.h b/init/paths.h
+index d129110..f6596de 100644
+--- a/init/paths.h
++++ b/init/paths.h
+@@ -113,5 +113,55 @@
+ #define TELINIT SBINDIR "/telinit"
+ #endif
+ 
++/**
++ * File extension for standard configuration files.
++ **/
++#define CONF_EXT_STD ".conf"
++
++/**
++ * File extension for override files.
++ *
++ * Note that override files are not stored in the ConfSource 'files' hash:
++ * all JobClass information from override files is added to the JobClass for
++ * the corresponding (CONF_EXT_STD) object.
++ **/
++#define CONF_EXT_OVERRIDE ".override"
++
++/**
++ * Determine if specified path extension representes a standard
++ * configuration file.
++ *
++ * @period: pointer to last period in path to check.
++ *
++ * Returns 1 if specified path extension matches that for a
++ * standard configuration file, else return 0.
++ **/
++#define IS_CONF_EXT_STD(period) \
++	(!strcmp (period, CONF_EXT_STD))
++
++/**
++ * Determine if specified path extension representes an
++ * override file.
++ *
++ * @period: pointer to last period in path to check.
++ *
++ * Returns 1 if specified path extension matches that for
++ * an override file, else return 0.
++ **/
++#define IS_CONF_EXT_OVERRIDE(period) \
++	(!strcmp (period, CONF_EXT_OVERRIDE))
++
++/**
++ * Determine if specified filename has a valid configuration
++ * file name extension.
++ *
++ * @period: pointer to last period in filename.
++ *
++ * Returns: TRUE if extension beyond @period is one of the
++ * recognized types, else FALSE.
++ **/
++#define IS_CONF_EXT(period) \
++	(IS_CONF_EXT_STD(period) || \
++	 IS_CONF_EXT_OVERRIDE(period))
+ 
+ #endif /* INIT_PATHS_H */
+diff --git a/init/tests/test_conf.c b/init/tests/test_conf.c
+index 3920d8b..c5fbbb7 100644
+--- a/init/tests/test_conf.c
++++ b/init/tests/test_conf.c
+@@ -46,6 +46,50 @@
+ #include "job.h"
+ #include "conf.h"
+ 
++/* macro to try and ensure the environment is as pristine as possible
++ * (to avoid follow-on errors caused by not freeing objects in a
++ * previous test, say)
++ */
++#define TEST_ENSURE_CLEAN_ENV()                                      \
++{                                                                    \
++	setvbuf(stdout, NULL, _IONBF, 0);                            \
++                                                                     \
++	if (job_classes) {                                           \
++		TEST_HASH_EMPTY (job_classes);                       \
++	}                                                            \
++                                                                     \
++	if (conf_sources) {                                          \
++		TEST_LIST_EMPTY (conf_sources);                      \
++	}                                                            \
++                                                                     \
++	if (nih_io_watches) {                                        \
++		TEST_LIST_EMPTY (nih_io_watches);                    \
++	}                                                            \
++                                                                     \
++	if (nih_timers) {                                            \
++		TEST_LIST_EMPTY (nih_timers);                        \
++	}                                                            \
++                                                                     \
++	if (events) {                                                \
++		TEST_LIST_EMPTY (events);                            \
++	}                                                            \
++}
++
++/* Force an inotify watch update */
++#define TEST_FORCE_WATCH_UPDATE()                                    \
++{                                                                    \
++	int         nfds = 0;                                        \
++	fd_set      readfds, writefds, exceptfds;                    \
++	                                                             \
++	FD_ZERO (&readfds);                                          \
++	FD_ZERO (&writefds);                                         \
++	FD_ZERO (&exceptfds);                                        \
++	                                                             \
++	nih_debug("calling nih_io_select_fds");                      \
++	nih_io_select_fds (&nfds, &readfds, &writefds, &exceptfds);  \
++	nih_debug("calling nih_io_handle_fds");                      \
++	nih_io_handle_fds (&readfds, &writefds, &exceptfds);         \
++}
+ 
+ void
+ test_source_new (void)
+@@ -2270,40 +2314,70 @@ no_inotify:
+ 	}
+ }
+ 
+-
+ void
+-test_source_reload_file (void)
++test_toggle_conf_name (void)
+ {
+-	ConfSource *source;
+-	ConfFile   *file, *old_file;
+-	FILE       *f;
+-	int         ret, fd[4096], i = 0, nfds;
+-	char        dirname[PATH_MAX];
+-	char        tmpname[PATH_MAX], filename[PATH_MAX];
+-	fd_set      readfds, writefds, exceptfds;
+-	NihError   *err;
++	char override_ext[] = ".override";
++	char dirname[PATH_MAX];
++	char filename[PATH_MAX];
++	JobClass *job;
++	char *f;
++	char *p;
+ 
+-	TEST_FUNCTION_FEATURE ("conf_source_reload",
+-			       "with configuration file");
+-	program_name = "test";
+-	nih_log_set_priority (NIH_LOG_FATAL);
++	TEST_FUNCTION_FEATURE ("toggle_conf_name",
++			"changing conf to override");
+ 
+ 	TEST_FILENAME (dirname);
+-	mkdir (dirname, 0755);
+-
+ 	strcpy (filename, dirname);
+ 	strcat (filename, "/foo.conf");
++	f = toggle_conf_name (NULL, filename);
++	TEST_NE_P (f, NULL);
+ 
+-	f = fopen (filename, "w");
+-	fprintf (f, "#nothing to test\n");
+-	fclose (f);
++	p = strstr (f, ".override");
++	TEST_NE_P (p, NULL);
++	TEST_EQ_P (p, f+strlen (f) - strlen (override_ext));
++	nih_free (f);
+ 
++	TEST_FEATURE ("changing override to conf");
+ 	strcpy (filename, dirname);
+-	strcat (filename, "/bar.conf");
++	strcat (filename, "/bar.override");
++	f = toggle_conf_name (NULL, filename);
++	TEST_NE_P (f, NULL);
+ 
+-	f = fopen (filename, "w");
+-	fprintf (f, "#nothing to test\n");
+-	fclose (f);
++	p = strstr (f, ".conf");
++	TEST_NE_P (p, NULL);
++	TEST_EQ_P (p, f+strlen (f) - strlen (".conf"));
++	nih_free (f);
++
++	/* test parent param */
++	job = job_class_new (NULL, "foo");
++	TEST_NE_P (job, NULL);
++
++	f = toggle_conf_name (job, filename);
++	TEST_NE_P (f, NULL);
++
++	TEST_EQ (TRUE, nih_alloc_parent (f, job));
++
++	nih_free (job);
++}
++
++void
++test_override (void)
++{
++	ConfSource *source;
++	ConfFile   *file;
++	FILE       *f;
++	int         ret, fd[4096], i = 0;
++	char        dirname[PATH_MAX];
++	char        filename[PATH_MAX], override[PATH_MAX];
++	JobClass   *job;
++	NihError   *err;
++
++	program_name = "test";
++	nih_log_set_priority (NIH_LOG_FATAL);
++
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_GROUP ("override files");
+ 
+ 	/* Make sure that we have inotify before performing some tests... */
+ 	if ((fd[0] = inotify_init ()) < 0) {
+@@ -2313,208 +2387,1427 @@ test_source_reload_file (void)
+ 	close (fd[0]);
+ 
+ 
+-	/* Check that we can load a file source for the first time.  An
+-	 * inotify watch should be established on the parent directory,
+-	 * the descriptor set to be closed-on-exec, but only that single
+-	 * file parsed.
++	/* Explicit test of behaviour prior to introduction of override files.
++	 * 
++	 * conf with no override before watch:
++	 *   create conf
++	 *   create watch
++	 *   ensure conf loaded
++	 *   update conf
++	 *   ensure conf updated
++	 *   delete conf
++	 *   ensure conf deleted
+ 	 */
+-	TEST_FEATURE ("with new conf file");
++	TEST_FEATURE ("with pre-override environment (conf with no override before watch)");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
++
++	/* create conf */
+ 	strcpy (filename, dirname);
+ 	strcat (filename, "/foo.conf");
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on started\n");
++	fprintf (f, "emits hello\n");
++	fclose (f);
+ 
+-	source = conf_source_new (NULL, filename, CONF_FILE);
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
+ 	ret = conf_source_reload (source);
+-
+ 	TEST_EQ (ret, 0);
+-	TEST_ALLOC_SIZE (source->watch, sizeof (NihWatch));
+-	TEST_EQ_STR (source->watch->path, dirname);
+-	TEST_EQ_P (source->watch->data, source);
+-
+-	TEST_TRUE (fcntl (source->watch->fd, F_GETFD) & FD_CLOEXEC);
+-
+-	TEST_EQ (source->flag, TRUE);
+ 
+-	strcpy (filename, dirname);
+-	strcat (filename, "/foo.conf");
++	/* ensure conf loaded */
+ 	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_NE_P (job->start_on, NULL);
+ 
+-	TEST_ALLOC_SIZE (file, sizeof (ConfFile));
+-	TEST_ALLOC_PARENT (file, source);
+-	TEST_EQ (file->flag, source->flag);
+-	TEST_EQ_P (file->data, NULL);
+-
+-	nih_free (file);
++	/* update conf */
++	f = fopen (filename, "a");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fclose (f);
+ 
++	TEST_FORCE_WATCH_UPDATE();
+ 
+-	strcpy (filename, dirname);
+-	strcat (filename, "/bar.conf");
++	/* ensure conf updated */
+ 	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_NE_P (job->start_on, NULL);
+ 
+-	TEST_EQ_P (file, NULL);
++	/* delete conf */
++	unlink (filename);
++
++	TEST_FORCE_WATCH_UPDATE();
+ 
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_EQ_P (job, NULL);
++	TEST_HASH_EMPTY (job_classes);
+ 	TEST_HASH_EMPTY (source->files);
+ 
+-	nih_free (source);
++	TEST_FORCE_WATCH_UPDATE();
+ 
++	/* ensure conf deleted */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_EQ_P (file, NULL);
+ 
+-	/* Check that if we create a new file in the directory, alongside
+-	 * the one we are watching, it is ignored.
++	nih_free (source);
++	TEST_EQ (rmdir (dirname), 0);
++
++
++	/* Explicit test of behaviour prior to introduction of override files.
++	 * 
++	 * conf with no override after watch:
++	 *   create watch
++	 *   create conf
++	 *   ensure conf loaded
++	 *   update conf
++	 *   ensure conf updated
++	 *   delete conf
++	 *   ensure conf deleted
+ 	 */
+-	TEST_FEATURE ("with new file alongside conf file");
+-	strcpy (filename, dirname);
+-	strcat (filename, "/foo.conf");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FEATURE ("with pre-override environment (conf with no override after watch)");
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
+ 
+-	source = conf_source_new (NULL, filename, CONF_FILE);
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
+ 	ret = conf_source_reload (source);
+-
+ 	TEST_EQ (ret, 0);
+ 
++	/* create conf */
+ 	strcpy (filename, dirname);
+-	strcat (filename, "/baz.conf");
+-
++	strcat (filename, "/foo.conf");
+ 	f = fopen (filename, "w");
+-	fprintf (f, "#nothing to test\n");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on started\n");
++	fprintf (f, "emits hello\n");
+ 	fclose (f);
+ 
+-	nfds = 0;
+-	FD_ZERO (&readfds);
+-	FD_ZERO (&writefds);
+-	FD_ZERO (&exceptfds);
+-
+-	nih_io_select_fds (&nfds, &readfds, &writefds, &exceptfds);
+-	nih_io_handle_fds (&readfds, &writefds, &exceptfds);
++	TEST_FORCE_WATCH_UPDATE();
+ 
++	/* ensure conf loaded */
+ 	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
+ 
+-	TEST_EQ_P (file, NULL);
+-
++	/* update conf */
++	f = fopen (filename, "a");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fclose (f);
+ 
+-	/* Check that if we modify a file in the directory, alongside
+-	 * the one we are watching, it is ignored.
+-	 */
+-	TEST_FEATURE ("with modification to file alongside conf file");
+-	strcpy (filename, dirname);
+-	strcat (filename, "/bar.conf");
++	TEST_FORCE_WATCH_UPDATE();
+ 
+-	f = fopen (filename, "w");
+-	fprintf (f, "#nothing to test\n");
+-	fclose (f);
++	/* ensure conf updated */
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_NE_P (job->start_on, NULL);
+ 
+-	nfds = 0;
+-	FD_ZERO (&readfds);
+-	FD_ZERO (&writefds);
+-	FD_ZERO (&exceptfds);
++	/* delete conf */
++	unlink (filename);
+ 
+-	nih_io_select_fds (&nfds, &readfds, &writefds, &exceptfds);
+-	nih_io_handle_fds (&readfds, &writefds, &exceptfds);
++	TEST_FORCE_WATCH_UPDATE();
+ 
++	/* ensure conf deleted */
+ 	file = (ConfFile *)nih_hash_lookup (source->files, filename);
+-
+ 	TEST_EQ_P (file, NULL);
++	nih_free (source);
++	TEST_EQ (rmdir (dirname), 0);
+ 
+ 
+-	/* Check that the configuration file we're watching can be modified
+-	 * using the direct writing technique.
+-	 */
+-	TEST_FEATURE ("with modification (direct write)");
+-	strcpy (filename, dirname);
+-	strcat (filename, "/foo.conf");
+-
+-	old_file = (ConfFile *)nih_hash_lookup (source->files, filename);
+-	TEST_FREE_TAG (old_file);
++	TEST_FEATURE ("ensure lone override ignored before watch");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
+ 
++	/* create override */
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.override");
+ 	f = fopen (filename, "w");
+-	fprintf (f, "#still nothing to test\n");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
+ 	fclose (f);
+ 
+-	nfds = 0;
+-	FD_ZERO (&readfds);
+-	FD_ZERO (&writefds);
+-	FD_ZERO (&exceptfds);
+-
+-	nih_io_select_fds (&nfds, &readfds, &writefds, &exceptfds);
+-	nih_io_handle_fds (&readfds, &writefds, &exceptfds);
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
++	ret = conf_source_reload (source);
++	TEST_EQ (ret, 0);
+ 
+-	TEST_FREE (old_file);
++	TEST_FORCE_WATCH_UPDATE();
+ 
++	/* ensure no conf object created */
++	TEST_HASH_EMPTY (source->files);
+ 	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_EQ_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_EQ_P (job, NULL);
+ 
+-	TEST_ALLOC_SIZE (file, sizeof (ConfFile));
+-	TEST_ALLOC_PARENT (file, source);
+-	TEST_EQ (file->flag, source->flag);
+-	TEST_EQ_P (file->data, NULL);
++	/* update override */
++	f = fopen (filename, "a");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "author \"me\"\n");
++	fclose (f);
+ 
+-	old_file = file;
++	TEST_FORCE_WATCH_UPDATE();
+ 
++	/* ensure no conf object created */
++	TEST_HASH_EMPTY (source->files);
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_EQ_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_EQ_P (job, NULL);
+ 
+-	/* Check that the configuration file we're watching can be modified
+-	 * using the write and then rename technique; it should be parsed
+-	 * and the previous file marked for deletion.
+-	 */
+-	TEST_FEATURE ("with modification (atomic rename)");
+-	strcpy (tmpname, dirname);
+-	strcat (tmpname, "/.foo.tmp");
++	/* delete override */
++	unlink (filename);
++	nih_free (source);
++	TEST_EQ (rmdir (dirname), 0);
+ 
+-	f = fopen (tmpname, "w");
+-	fprintf (f, "#nothing to test\n");
+-	fclose (f);
+ 
+-	strcpy (filename, dirname);
+-	strcat (filename, "/foo.conf");
++	TEST_FEATURE ("ensure lone override ignored after watch");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
+ 
+-	rename (tmpname, filename);
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
++	ret = conf_source_reload (source);
++	TEST_EQ (ret, 0);
+ 
+-	TEST_FREE_TAG (old_file);
++	strcpy (filename, dirname);
++	strcat (filename, "/bar.override");
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fclose (f);
+ 
+-	nfds = 0;
+-	FD_ZERO (&readfds);
+-	FD_ZERO (&writefds);
+-	FD_ZERO (&exceptfds);
++	TEST_FORCE_WATCH_UPDATE();
+ 
+-	nih_io_select_fds (&nfds, &readfds, &writefds, &exceptfds);
+-	nih_io_handle_fds (&readfds, &writefds, &exceptfds);
++	/* ensure no conf object created */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_EQ_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "bar");
++	TEST_EQ_P (job, NULL);
+ 
+-	TEST_FREE (old_file);
++	/* delete override */
++	unlink (filename);
+ 
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure override still not present */
+ 	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_EQ_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "bar");
++	TEST_EQ_P (job, NULL);
+ 
+-	TEST_ALLOC_SIZE (file, sizeof (ConfFile));
+-	TEST_ALLOC_PARENT (file, source);
+-	TEST_EQ (file->flag, source->flag);
+-	TEST_EQ_P (file->data, NULL);
++	nih_free (source);
++	TEST_EQ (rmdir (dirname), 0);
+ 
+-	old_file = file;
+ 
++	TEST_FEATURE ("create conf, watch, then create/modify/delete override");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
+ 
+-	/* Check that we can delete the configuration file that we're
+-	 * watching, the metadata for it should be lost.
+-	 */
+-	TEST_FEATURE ("with deletion");
++	/* create conf */
+ 	strcpy (filename, dirname);
+ 	strcat (filename, "/foo.conf");
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on started\n");
++	fprintf (f, "emits hello\n");
++	fclose (f);
+ 
+-	unlink (filename);
+-
+-	TEST_FREE_TAG (old_file);
+-
+-	nfds = 0;
+-	FD_ZERO (&readfds);
+-	FD_ZERO (&writefds);
+-	FD_ZERO (&exceptfds);
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
++	ret = conf_source_reload (source);
++	TEST_EQ (ret, 0);
+ 
+-	nih_io_select_fds (&nfds, &readfds, &writefds, &exceptfds);
+-	nih_io_handle_fds (&readfds, &writefds, &exceptfds);
++	/* ensure conf loaded */
++	TEST_HASH_NOT_EMPTY (source->files);
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_EQ_P ((job->emits)[1], NULL);
++	TEST_NE_P (job->start_on, NULL);
++
++	/* create override */
++	strcpy (override, dirname);
++	strcat (override, "/foo.override");
++	f = fopen (override, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fclose (f);
+ 
+-	TEST_FREE (old_file);
++	TEST_HASH_NOT_EMPTY (source->files);
++	TEST_FORCE_WATCH_UPDATE();
+ 
++	/* ensure conf updated */
++	TEST_HASH_NOT_EMPTY (source->files);
+ 	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_NE_P (job->start_on, NULL);
+ 
++	/* ensure no override in hash */
++	file = (ConfFile *)nih_hash_lookup (source->files, override);
+ 	TEST_EQ_P (file, NULL);
+ 
++	/* modify override */
++	f = fopen (override, "a");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "emits world\n");
++	fclose (f);
+ 
+-	/* Check that the watch allows us to see if the file we want is
+-	 * created using the direct writing technique, and thus parsed.
+-	 */
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf updated */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_EQ_STR ((job->emits)[1], "world");
++
++	/* delete override */
++	unlink (override);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf reverted */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_EQ_P ((job->emits)[1], NULL);
++
++	nih_free (source);
++	unlink (filename);
++	TEST_EQ (rmdir (dirname), 0);
++
++
++	TEST_FEATURE ("create watch, conf, then create/modify/delete override");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
++
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
++	ret = conf_source_reload (source);
++	TEST_EQ (ret, 0);
++
++	/* create conf */
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on started\n");
++	fprintf (f, "emits hello\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf loaded */
++	TEST_HASH_NOT_EMPTY (source->files);
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_EQ_P ((job->emits)[1], NULL);
++	TEST_NE_P (job->start_on, NULL);
++
++	/* create override */
++	strcpy (override, dirname);
++	strcat (override, "/foo.override");
++	f = fopen (override, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fclose (f);
++
++	TEST_HASH_NOT_EMPTY (source->files);
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf updated */
++	TEST_HASH_NOT_EMPTY (source->files);
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_NE_P (job->start_on, NULL);
++
++	/* ensure no override in hash */
++	file = (ConfFile *)nih_hash_lookup (source->files, override);
++	TEST_EQ_P (file, NULL);
++
++	/* modify override */
++	f = fopen (override, "a");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "emits world\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf updated */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_EQ_STR ((job->emits)[1], "world");
++
++	/* delete override */
++	unlink (override);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf reverted */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_EQ_P ((job->emits)[1], NULL);
++
++	nih_free (source);
++	unlink (filename);
++	TEST_EQ (rmdir (dirname), 0);
++
++
++	TEST_FEATURE ("create override, watch, then create/modify/delete conf");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
++
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++	strcpy (override, dirname);
++	strcat (override, "/foo.override");
++
++	/* create override */
++	f = fopen (override, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fprintf (f, "author \"bar\"\n");
++	fclose (f);
++
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
++	ret = conf_source_reload (source);
++	TEST_EQ (ret, 0);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure no conf object created */
++	TEST_HASH_EMPTY (source->files);
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_EQ_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_EQ_P (job, NULL);
++
++	/* create conf */
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on started\n");
++	fprintf (f, "emits hello\n");
++	fprintf (f, "author \"foo\"\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf loaded */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++
++	/* should pick up override, *NOT* conf */
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR (job->author, "bar");
++
++	/* modify conf */
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on wibble\n");
++	fprintf (f, "emits moo\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf reloaded and updated with override */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "moo");
++
++	/* should pick up override, *NOT* conf */
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR (job->author, "bar");
++
++	/* delete conf */
++	unlink (filename);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf object deleted */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_EQ_P (file, NULL);
++	TEST_HASH_EMPTY (source->files);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_EQ_P (job, NULL);
++	file = (ConfFile *)nih_hash_lookup (source->files, override);
++	TEST_EQ_P (file, NULL);
++
++	unlink (override);
++
++	/* ensure no conf object still */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_EQ_P (file, NULL);
++	TEST_HASH_EMPTY (source->files);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_EQ_P (job, NULL);
++	file = (ConfFile *)nih_hash_lookup (source->files, override);
++	TEST_EQ_P (file, NULL);
++
++	nih_free (source);
++	TEST_EQ (rmdir (dirname), 0);
++
++
++	TEST_FEATURE ("create watch, override, then create/modify/delete conf");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
++
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
++	ret = conf_source_reload (source);
++	TEST_EQ (ret, 0);
++
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++	strcpy (override, dirname);
++	strcat (override, "/foo.override");
++
++	/* create override */
++	f = fopen (override, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fprintf (f, "author \"bar\"\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure no conf object created */
++	TEST_HASH_EMPTY (source->files);
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_EQ_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_EQ_P (job, NULL);
++
++	/* create conf */
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on started\n");
++	fprintf (f, "emits hello\n");
++	fprintf (f, "author \"foo\"\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf loaded */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++
++	/* should pick up override, *NOT* conf */
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR (job->author, "bar");
++
++	/* modify conf */
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on wibble\n");
++	fprintf (f, "emits moo\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf reloaded and updated with override */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "moo");
++
++	/* should pick up override, *NOT* conf */
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR (job->author, "bar");
++
++	/* delete conf */
++	unlink (filename);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf object deleted */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_EQ_P (file, NULL);
++	TEST_HASH_EMPTY (source->files);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_EQ_P (job, NULL);
++	file = (ConfFile *)nih_hash_lookup (source->files, override);
++	TEST_EQ_P (file, NULL);
++
++	unlink (override);
++
++	/* ensure no conf object still */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_EQ_P (file, NULL);
++	TEST_HASH_EMPTY (source->files);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_EQ_P (job, NULL);
++	file = (ConfFile *)nih_hash_lookup (source->files, override);
++	TEST_EQ_P (file, NULL);
++
++	nih_free (source);
++	TEST_EQ (rmdir (dirname), 0);
++
++
++	TEST_FEATURE ("create override, watch, conf, then modify/delete override");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
++
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++	strcpy (override, dirname);
++	strcat (override, "/foo.override");
++
++	/* create override */
++	f = fopen (override, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fprintf (f, "author \"bar\"\n");
++	fclose (f);
++
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
++	ret = conf_source_reload (source);
++	TEST_EQ (ret, 0);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure no conf object created */
++	TEST_HASH_EMPTY (source->files);
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_EQ_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_EQ_P (job, NULL);
++
++	/* create conf */
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on started\n");
++	fprintf (f, "emits hello\n");
++	fprintf (f, "author \"foo\"\n");
++	fclose (f);
++
++	/* FIXME: crashes here */
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf loaded */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++
++	/* should pick up override, *NOT* conf */
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR (job->author, "bar");
++
++	/* modify override */
++	f = fopen (override, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "author \"meh\"\n");
++	fprintf (f, "env wibble=wobble\n");
++	fprintf (f, "start on manual\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf reloaded and updated with override */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++
++	/* should pick up override, *NOT* conf */
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR (job->author, "meh");
++	TEST_EQ_STR ((job->env)[0], "wibble=wobble");
++
++	/* delete override */
++	unlink (override);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf object reverted */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR (job->author, "foo");
++	TEST_EQ_P (job->env, NULL);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++
++	unlink (filename);
++	nih_free (source);
++	TEST_EQ (rmdir (dirname), 0);
++
++
++	TEST_FEATURE ("create watch, override, conf, then modify/delete override");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
++
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++	strcpy (override, dirname);
++	strcat (override, "/foo.override");
++
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
++	ret = conf_source_reload (source);
++	TEST_EQ (ret, 0);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* create override */
++	f = fopen (override, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fprintf (f, "author \"bar\"\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* create conf */
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on started\n");
++	fprintf (f, "emits hello\n");
++	fprintf (f, "author \"foo\"\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf loaded */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++
++	/* should pick up override, *NOT* conf */
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR (job->author, "bar");
++
++	/* update override */
++	f = fopen (override, "a");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "author \"me\"\n");
++	fprintf (f, "env wibble=wobble\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf reloaded and updated with override */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++
++	/* should pick up override, *NOT* conf */
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR (job->author, "me");
++	TEST_EQ_STR ((job->env)[0], "wibble=wobble");
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* delete override */
++	unlink (override);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf loaded */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR (job->author, "foo");
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_P (job->env, NULL);
++
++	unlink (filename);
++	nih_free (source);
++	TEST_EQ (rmdir (dirname), 0);
++
++
++	TEST_FEATURE ("create both conf+override files, watch, then modify/delete conf");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
++
++	/* create conf */
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on started\n");
++	fprintf (f, "author \"me\"\n");
++	fprintf (f, "env foo=bar\n");
++	fprintf (f, "emits hello\n");
++	fclose (f);
++
++	/* create override */
++	strcpy (override, dirname);
++	strcat (override, "/foo.override");
++	f = fopen (override, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fprintf (f, "author \"you\"\n");
++	fclose (f);
++
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
++	ret = conf_source_reload (source);
++	TEST_EQ (ret, 0);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf loaded */
++	TEST_HASH_NOT_EMPTY (source->files);
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_EQ_STR (job->author, "you");
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR ((job->env)[0], "foo=bar");
++	TEST_EQ_P (job->export, NULL);
++
++	/* modify conf */
++	f = fopen (filename, "a");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "export foo\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf updated */
++	TEST_HASH_NOT_EMPTY (source->files);
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_STR ((job->env)[0], "foo=bar");
++	TEST_NE_P (job->export, NULL);
++	TEST_EQ_STR ((job->export)[0], "foo");
++
++	/* delete conf */
++	unlink (filename);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf object deleted */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_EQ_P (file, NULL);
++	TEST_HASH_EMPTY (source->files);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_EQ_P (job, NULL);
++	file = (ConfFile *)nih_hash_lookup (source->files, override);
++	TEST_EQ_P (file, NULL);
++
++	unlink (override);
++	nih_free (source);
++	TEST_EQ (rmdir (dirname), 0);
++
++	TEST_FEATURE ("create both conf+override files, watch, then modify/delete override");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
++
++	/* create conf */
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on started\n");
++	fprintf (f, "author \"me\"\n");
++	fprintf (f, "env foo=bar\n");
++	fprintf (f, "emits hello\n");
++	fclose (f);
++
++	/* create override */
++	strcpy (override, dirname);
++	strcat (override, "/foo.override");
++	f = fopen (override, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fprintf (f, "author \"you\"\n");
++	fclose (f);
++
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
++	ret = conf_source_reload (source);
++	TEST_EQ (ret, 0);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf loaded */
++	TEST_HASH_NOT_EMPTY (source->files);
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_EQ_STR (job->author, "you");
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR ((job->env)[0], "foo=bar");
++	TEST_EQ_P (job->export, NULL);
++
++	/* modify override */
++	f = fopen (override, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "description \"hello world\"\n");
++	fprintf (f, "author \"ubuntu\"\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf updated */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR (job->author, "ubuntu");
++	TEST_NE_P (job->description, NULL);
++	TEST_EQ_STR (job->description, "hello world");
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_NE_P (job->start_on, NULL);
++
++	/* delete override */
++	unlink (override);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf updated */
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR ((job->env)[0], "foo=bar");
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_EQ_STR (job->author, "me");
++	TEST_EQ_P (job->description, NULL);
++
++	nih_free (source);
++	unlink (filename);
++	TEST_EQ (rmdir (dirname), 0);
++
++
++	TEST_FEATURE ("create conf, watch, then create invalid override, delete override");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
++
++	/* create conf */
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on started\n");
++	fprintf (f, "author \"wibble\"\n");
++	fprintf (f, "emits hello\n");
++	fclose (f);
++
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
++	ret = conf_source_reload (source);
++	TEST_EQ (ret, 0);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf loaded */
++	TEST_HASH_NOT_EMPTY (source->files);
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_NE_P (job->start_on, NULL);
++
++	/* create (partially) invalid override (which should be
++	 * fully ignored)
++	 */
++	strcpy (override, dirname);
++	strcat (override, "/foo.override");
++	f = fopen (override, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fprintf (f, "bleaugh!\n");
++	fprintf (f, "wha...?\n");
++	fprintf (f, "author \"moo\"\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	unlink (override);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf still loaded */
++	TEST_HASH_NOT_EMPTY (source->files);
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR (job->author, "wibble");
++
++	nih_free (source);
++	unlink (filename);
++	TEST_EQ (rmdir (dirname), 0);
++
++	TEST_FEATURE ("ensure override ignored for CONF_FILE");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
++
++	/* create empty conf */
++	strcpy (filename, dirname);
++	strcat (filename, "/init.conf");
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fclose (f);
++
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_FILE);
++	TEST_NE_P (source, NULL);
++	ret = conf_source_reload (source);
++
++	/* We expect conf_source_reload to fail in this situation since
++	 * although "init.conf" is a supported config file, it is not
++	 * allowed to contain any stanzas, implying that it can only
++	 * contain comments. In fact, if the file exists but is zero
++	 * size that is currently an error since upstart blindly calls
++	 * nih_file_read(), which will fail since there are no bytes to
++	 * read.
++	 */
++	TEST_NE (ret, 0);
++	err = nih_error_steal ();
++	TEST_EQ (err->number, EILSEQ);
++	nih_free (err);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf NOT loaded */
++	TEST_HASH_EMPTY (source->files);
++
++	/* create override */
++	strcpy (override, dirname);
++	strcat (override, "/init.override");
++	f = fopen (override, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fclose (f);
++
++	TEST_FORCE_WATCH_UPDATE();
++
++	/* ensure conf still NOT loaded */
++	TEST_HASH_EMPTY (source->files);
++
++	nih_free (source);
++	unlink (filename);
++	unlink (override);
++	TEST_EQ (rmdir (dirname), 0);
++
++	/* Consume all available inotify instances so that the following
++	 * tests run without inotify.
++	 */
++	for (i = 0; i < 4096; i++)
++		if ((fd[i] = inotify_init ()) < 0)
++			break;
++
++no_inotify:
++	/* If you don't have inotify, any override file must exist
++	 * before the system boots.
++	 */ 
++
++	TEST_FEATURE ("both conf+override files with no inotify support");
++	TEST_ENSURE_CLEAN_ENV ();
++	TEST_FILENAME (dirname);
++	TEST_EQ (mkdir (dirname, 0755), 0);
++
++	/* create conf */
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++	f = fopen (filename, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on started\n");
++	fprintf (f, "author \"me\"\n");
++	fprintf (f, "env foo=bar\n");
++	fprintf (f, "emits hello\n");
++	fclose (f);
++
++	/* create override */
++	strcpy (override, dirname);
++	strcat (override, "/foo.override");
++	f = fopen (override, "w");
++	TEST_NE_P (f, NULL);
++	fprintf (f, "start on manual\n");
++	fprintf (f, "author \"you\"\n");
++	fclose (f);
++
++	/* create watch */
++	source = conf_source_new (NULL, dirname, CONF_JOB_DIR);
++	TEST_NE_P (source, NULL);
++	ret = conf_source_reload (source);
++	TEST_EQ (ret, 0);
++
++	/* ensure conf loaded */
++	TEST_HASH_NOT_EMPTY (source->files);
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_NE_P (file, NULL);
++	job = (JobClass *)nih_hash_lookup (job_classes, "foo");
++	TEST_NE_P (job, NULL);
++	TEST_EQ_P (file->job, job);
++	TEST_EQ_STR ((job->emits)[0], "hello");
++	TEST_EQ_STR (job->author, "you");
++	TEST_NE_P (job->start_on, NULL);
++	TEST_EQ_STR ((job->env)[0], "foo=bar");
++	TEST_EQ_P (job->export, NULL);
++
++	nih_free (source);
++	unlink (filename);
++	unlink (override);
++	TEST_EQ (rmdir (dirname), 0);
++
++
++	nih_log_set_priority (NIH_LOG_MESSAGE);
++
++	/* Release consumed instances */
++	for (i = 0; i < 4096; i++) {
++		if (fd[i] < 0)
++			break;
++
++		close (fd[i]);
++	}
++}
++
++void
++test_source_reload_file (void)
++{
++	ConfSource *source;
++	ConfFile   *file, *old_file;
++	FILE       *f;
++	int         ret, fd[4096], i = 0, nfds;
++	char        dirname[PATH_MAX];
++	char        tmpname[PATH_MAX], filename[PATH_MAX];
++	fd_set      readfds, writefds, exceptfds;
++	NihError   *err;
++
++	TEST_FUNCTION_FEATURE ("conf_source_reload",
++			       "with configuration file");
++	program_name = "test";
++	nih_log_set_priority (NIH_LOG_FATAL);
++
++	TEST_FILENAME (dirname);
++	mkdir (dirname, 0755);
++
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++
++	f = fopen (filename, "w");
++	fprintf (f, "#nothing to test\n");
++	fclose (f);
++
++	strcpy (filename, dirname);
++	strcat (filename, "/bar.conf");
++
++	f = fopen (filename, "w");
++	fprintf (f, "#nothing to test\n");
++	fclose (f);
++
++	/* Make sure that we have inotify before performing some tests... */
++	if ((fd[0] = inotify_init ()) < 0) {
++		printf ("SKIP: inotify not available\n");
++		goto no_inotify;
++	}
++	close (fd[0]);
++
++
++	/* Check that we can load a file source for the first time.  An
++	 * inotify watch should be established on the parent directory,
++	 * the descriptor set to be closed-on-exec, but only that single
++	 * file parsed.
++	 */
++	TEST_FEATURE ("with new conf file");
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++
++	source = conf_source_new (NULL, filename, CONF_FILE);
++	ret = conf_source_reload (source);
++
++	TEST_EQ (ret, 0);
++	TEST_ALLOC_SIZE (source->watch, sizeof (NihWatch));
++	TEST_EQ_STR (source->watch->path, dirname);
++	TEST_EQ_P (source->watch->data, source);
++
++	TEST_TRUE (fcntl (source->watch->fd, F_GETFD) & FD_CLOEXEC);
++
++	TEST_EQ (source->flag, TRUE);
++
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++
++	TEST_ALLOC_SIZE (file, sizeof (ConfFile));
++	TEST_ALLOC_PARENT (file, source);
++	TEST_EQ (file->flag, source->flag);
++	TEST_EQ_P (file->data, NULL);
++
++	nih_free (file);
++
++
++	strcpy (filename, dirname);
++	strcat (filename, "/bar.conf");
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++
++	TEST_EQ_P (file, NULL);
++
++	TEST_HASH_EMPTY (source->files);
++
++	nih_free (source);
++
++
++	/* Check that if we create a new file in the directory, alongside
++	 * the one we are watching, it is ignored.
++	 */
++	TEST_FEATURE ("with new file alongside conf file");
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++
++	source = conf_source_new (NULL, filename, CONF_FILE);
++	ret = conf_source_reload (source);
++
++	TEST_EQ (ret, 0);
++
++	strcpy (filename, dirname);
++	strcat (filename, "/baz.conf");
++
++	f = fopen (filename, "w");
++	fprintf (f, "#nothing to test\n");
++	fclose (f);
++
++	nfds = 0;
++	FD_ZERO (&readfds);
++	FD_ZERO (&writefds);
++	FD_ZERO (&exceptfds);
++
++	nih_io_select_fds (&nfds, &readfds, &writefds, &exceptfds);
++	nih_io_handle_fds (&readfds, &writefds, &exceptfds);
++
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++
++	TEST_EQ_P (file, NULL);
++
++
++	/* Check that if we modify a file in the directory, alongside
++	 * the one we are watching, it is ignored.
++	 */
++	TEST_FEATURE ("with modification to file alongside conf file");
++	strcpy (filename, dirname);
++	strcat (filename, "/bar.conf");
++
++	f = fopen (filename, "w");
++	fprintf (f, "#nothing to test\n");
++	fclose (f);
++
++	nfds = 0;
++	FD_ZERO (&readfds);
++	FD_ZERO (&writefds);
++	FD_ZERO (&exceptfds);
++
++	nih_io_select_fds (&nfds, &readfds, &writefds, &exceptfds);
++	nih_io_handle_fds (&readfds, &writefds, &exceptfds);
++
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++
++	TEST_EQ_P (file, NULL);
++
++
++	/* Check that the configuration file we're watching can be modified
++	 * using the direct writing technique.
++	 */
++	TEST_FEATURE ("with modification (direct write)");
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++
++	old_file = (ConfFile *)nih_hash_lookup (source->files, filename);
++	TEST_FREE_TAG (old_file);
++
++	f = fopen (filename, "w");
++	fprintf (f, "#still nothing to test\n");
++	fclose (f);
++
++	nfds = 0;
++	FD_ZERO (&readfds);
++	FD_ZERO (&writefds);
++	FD_ZERO (&exceptfds);
++
++	nih_io_select_fds (&nfds, &readfds, &writefds, &exceptfds);
++	nih_io_handle_fds (&readfds, &writefds, &exceptfds);
++
++	TEST_FREE (old_file);
++
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++
++	TEST_ALLOC_SIZE (file, sizeof (ConfFile));
++	TEST_ALLOC_PARENT (file, source);
++	TEST_EQ (file->flag, source->flag);
++	TEST_EQ_P (file->data, NULL);
++
++	old_file = file;
++
++
++	/* Check that the configuration file we're watching can be modified
++	 * using the write and then rename technique; it should be parsed
++	 * and the previous file marked for deletion.
++	 */
++	TEST_FEATURE ("with modification (atomic rename)");
++	strcpy (tmpname, dirname);
++	strcat (tmpname, "/.foo.tmp");
++
++	f = fopen (tmpname, "w");
++	fprintf (f, "#nothing to test\n");
++	fclose (f);
++
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++
++	rename (tmpname, filename);
++
++	TEST_FREE_TAG (old_file);
++
++	nfds = 0;
++	FD_ZERO (&readfds);
++	FD_ZERO (&writefds);
++	FD_ZERO (&exceptfds);
++
++	nih_io_select_fds (&nfds, &readfds, &writefds, &exceptfds);
++	nih_io_handle_fds (&readfds, &writefds, &exceptfds);
++
++	TEST_FREE (old_file);
++
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++
++	TEST_ALLOC_SIZE (file, sizeof (ConfFile));
++	TEST_ALLOC_PARENT (file, source);
++	TEST_EQ (file->flag, source->flag);
++	TEST_EQ_P (file->data, NULL);
++
++	old_file = file;
++
++
++	/* Check that we can delete the configuration file that we're
++	 * watching, the metadata for it should be lost.
++	 */
++	TEST_FEATURE ("with deletion");
++	strcpy (filename, dirname);
++	strcat (filename, "/foo.conf");
++
++	unlink (filename);
++
++	TEST_FREE_TAG (old_file);
++
++	nfds = 0;
++	FD_ZERO (&readfds);
++	FD_ZERO (&writefds);
++	FD_ZERO (&exceptfds);
++
++	nih_io_select_fds (&nfds, &readfds, &writefds, &exceptfds);
++	nih_io_handle_fds (&readfds, &writefds, &exceptfds);
++
++	TEST_FREE (old_file);
++
++	file = (ConfFile *)nih_hash_lookup (source->files, filename);
++
++	TEST_EQ_P (file, NULL);
++
++
++	/* Check that the watch allows us to see if the file we want is
++	 * created using the direct writing technique, and thus parsed.
++	 */
+ 	TEST_FEATURE ("with creation (direct write)");
+ 	strcpy (filename, dirname);
+ 	strcat (filename, "/foo.conf");
+@@ -2822,8 +4115,6 @@ test_source_reload_file (void)
+ 	TEST_HASH_EMPTY (source->files);
+ 
+ 	nih_free (source);
+-
+-
+ 	/* Consume all available inotify instances so that the following
+ 	 * tests run without inotify.
+ 	 */
+@@ -3309,6 +4600,8 @@ main (int   argc,
+ 	test_source_reload_conf_dir ();
+ 	test_source_reload_file ();
+ 	test_source_reload ();
++	test_toggle_conf_name ();
++	test_override ();
+ 	test_file_destroy ();
+ 	test_select_job ();
+ 
+diff --git a/init/tests/test_parse_job.c b/init/tests/test_parse_job.c
+index 180c10a..0290dff 100644
+--- a/init/tests/test_parse_job.c
++++ b/init/tests/test_parse_job.c
+@@ -64,7 +64,7 @@ test_parse_job (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -110,7 +110,7 @@ test_parse_job (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -131,6 +131,45 @@ test_parse_job (void)
+ 
+ 		nih_free (job);
+ 	}
++
++	TEST_FEATURE ("with non-NULL update parameter (override)");
++	{
++		JobClass *tmp = NULL;
++
++		strcpy (buf, "start on starting\n");
++		strcat (buf, "author \"me\"\n");
++
++		pos = 0;
++		lineno = 1;
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
++				&pos, &lineno);
++
++		TEST_NE_P (job, NULL);
++		TEST_EQ_STR (job->author, "me");
++		TEST_NE_P (job->start_on, NULL);
++
++		strcat (buf, "author \"you\"\n");
++		/* strcat (buf, "manual\n"); */
++		strcat (buf, "description \"my description\"\n");
++
++		pos = 0;
++		lineno = 1;
++  		tmp = parse_job (NULL, job, "test", buf, strlen (buf),
++				&pos, &lineno);
++		TEST_NE_P (tmp, NULL);
++
++		/* if passed a job, the same object should be returned.
++		 */
++		TEST_EQ_P (tmp, job);
++
++		TEST_EQ_STR (tmp->author, "you");
++		/* TEST_EQ_P (tmp->start_on, NULL); */
++		TEST_NE_P (tmp->description, NULL);
++
++		TEST_EQ_STR (tmp->description, "my description");
++
++		nih_free (job);
++	}
+ }
+ 
+ void
+@@ -153,7 +192,7 @@ test_stanza_exec (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -190,7 +229,7 @@ test_stanza_exec (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -229,7 +268,7 @@ test_stanza_exec (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -266,7 +305,7 @@ test_stanza_exec (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -299,7 +338,7 @@ test_stanza_script (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -340,7 +379,7 @@ test_stanza_script (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -379,7 +418,7 @@ test_stanza_script (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -416,7 +455,7 @@ test_stanza_script (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -447,7 +486,7 @@ test_stanza_pre_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -484,7 +523,7 @@ test_stanza_pre_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -524,7 +563,7 @@ test_stanza_pre_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -565,7 +604,7 @@ test_stanza_pre_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -604,7 +643,7 @@ test_stanza_pre_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -643,7 +682,7 @@ test_stanza_pre_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -680,7 +719,7 @@ test_stanza_pre_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -699,7 +738,7 @@ test_stanza_pre_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -718,7 +757,7 @@ test_stanza_pre_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -737,7 +776,7 @@ test_stanza_pre_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -768,7 +807,7 @@ test_stanza_post_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -805,7 +844,7 @@ test_stanza_post_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -845,7 +884,7 @@ test_stanza_post_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -886,7 +925,7 @@ test_stanza_post_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -925,7 +964,7 @@ test_stanza_post_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -964,7 +1003,7 @@ test_stanza_post_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1001,7 +1040,7 @@ test_stanza_post_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -1020,7 +1059,7 @@ test_stanza_post_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -1039,7 +1078,7 @@ test_stanza_post_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -1058,7 +1097,7 @@ test_stanza_post_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -1089,7 +1128,7 @@ test_stanza_pre_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1126,7 +1165,7 @@ test_stanza_pre_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1166,7 +1205,7 @@ test_stanza_pre_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1207,7 +1246,7 @@ test_stanza_pre_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1246,7 +1285,7 @@ test_stanza_pre_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1285,7 +1324,7 @@ test_stanza_pre_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1322,7 +1361,7 @@ test_stanza_pre_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -1341,7 +1380,7 @@ test_stanza_pre_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -1360,7 +1399,7 @@ test_stanza_pre_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -1379,7 +1418,7 @@ test_stanza_pre_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -1410,7 +1449,7 @@ test_stanza_post_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1447,7 +1486,7 @@ test_stanza_post_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1487,7 +1526,7 @@ test_stanza_post_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1528,7 +1567,7 @@ test_stanza_post_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1567,7 +1606,7 @@ test_stanza_post_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1606,7 +1645,7 @@ test_stanza_post_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1643,7 +1682,7 @@ test_stanza_post_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -1662,7 +1701,7 @@ test_stanza_post_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -1681,7 +1720,7 @@ test_stanza_post_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -1700,7 +1739,7 @@ test_stanza_post_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -1731,7 +1770,7 @@ test_stanza_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1776,7 +1815,7 @@ test_stanza_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1828,7 +1867,7 @@ test_stanza_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1879,7 +1918,7 @@ test_stanza_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -1942,7 +1981,7 @@ test_stanza_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -2012,7 +2051,7 @@ test_stanza_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -2090,7 +2129,7 @@ test_stanza_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -2170,7 +2209,7 @@ test_stanza_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -2249,7 +2288,7 @@ test_stanza_start (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -2291,7 +2330,7 @@ test_stanza_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -2310,7 +2349,7 @@ test_stanza_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -2329,7 +2368,7 @@ test_stanza_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -2348,7 +2387,7 @@ test_stanza_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -2367,7 +2406,7 @@ test_stanza_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -2384,7 +2423,7 @@ test_stanza_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -2403,7 +2442,7 @@ test_stanza_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -2422,7 +2461,7 @@ test_stanza_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -2441,7 +2480,7 @@ test_stanza_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -2460,7 +2499,7 @@ test_stanza_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -2479,7 +2518,7 @@ test_stanza_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -2498,7 +2537,7 @@ test_stanza_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -2517,7 +2556,7 @@ test_stanza_start (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -2548,7 +2587,7 @@ test_stanza_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -2593,7 +2632,7 @@ test_stanza_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -2645,7 +2684,7 @@ test_stanza_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -2696,7 +2735,7 @@ test_stanza_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -2759,7 +2798,7 @@ test_stanza_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -2829,7 +2868,7 @@ test_stanza_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -2907,7 +2946,7 @@ test_stanza_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -2987,7 +3026,7 @@ test_stanza_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3066,7 +3105,7 @@ test_stanza_stop (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3108,7 +3147,7 @@ test_stanza_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3127,7 +3166,7 @@ test_stanza_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3146,7 +3185,7 @@ test_stanza_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3165,7 +3204,7 @@ test_stanza_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3184,7 +3223,7 @@ test_stanza_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3201,7 +3240,7 @@ test_stanza_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3220,7 +3259,7 @@ test_stanza_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3239,7 +3278,7 @@ test_stanza_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3258,7 +3297,7 @@ test_stanza_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3277,7 +3316,7 @@ test_stanza_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3296,7 +3335,7 @@ test_stanza_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3315,7 +3354,7 @@ test_stanza_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3334,7 +3373,7 @@ test_stanza_stop (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3364,7 +3403,7 @@ test_stanza_description (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3397,7 +3436,7 @@ test_stanza_description (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3430,7 +3469,7 @@ test_stanza_description (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3449,7 +3488,7 @@ test_stanza_description (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3479,7 +3518,7 @@ test_stanza_author (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3512,7 +3551,7 @@ test_stanza_author (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3545,7 +3584,7 @@ test_stanza_author (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3564,7 +3603,7 @@ test_stanza_author (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3594,7 +3633,7 @@ test_stanza_version (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3627,7 +3666,7 @@ test_stanza_version (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3660,7 +3699,7 @@ test_stanza_version (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3679,7 +3718,7 @@ test_stanza_version (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3709,7 +3748,7 @@ test_stanza_emits (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3746,7 +3785,7 @@ test_stanza_emits (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3789,7 +3828,7 @@ test_stanza_emits (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3831,7 +3870,7 @@ test_stanza_emits (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -3861,7 +3900,7 @@ test_stanza_expect (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3894,7 +3933,7 @@ test_stanza_expect (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3927,7 +3966,7 @@ test_stanza_expect (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3960,7 +3999,7 @@ test_stanza_expect (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -3993,7 +4032,7 @@ test_stanza_expect (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -4025,7 +4064,7 @@ test_stanza_expect (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4044,7 +4083,7 @@ test_stanza_expect (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4063,7 +4102,7 @@ test_stanza_expect (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4091,7 +4130,7 @@ test_stanza_respawn (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -4125,7 +4164,7 @@ test_stanza_respawn (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -4158,7 +4197,7 @@ test_stanza_respawn (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -4192,7 +4231,7 @@ test_stanza_respawn (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -4225,7 +4264,7 @@ test_stanza_respawn (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -4258,7 +4297,7 @@ test_stanza_respawn (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4277,7 +4316,7 @@ test_stanza_respawn (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4296,7 +4335,7 @@ test_stanza_respawn (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4315,7 +4354,7 @@ test_stanza_respawn (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4334,7 +4373,7 @@ test_stanza_respawn (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4353,7 +4392,7 @@ test_stanza_respawn (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4372,7 +4411,7 @@ test_stanza_respawn (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4391,7 +4430,7 @@ test_stanza_respawn (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4410,7 +4449,7 @@ test_stanza_respawn (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4429,7 +4468,7 @@ test_stanza_respawn (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4448,7 +4487,7 @@ test_stanza_respawn (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4467,7 +4506,7 @@ test_stanza_respawn (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4497,7 +4536,7 @@ test_stanza_task (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -4529,7 +4568,7 @@ test_stanza_task (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -4561,7 +4600,7 @@ test_stanza_task (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4591,7 +4630,7 @@ test_stanza_instance (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -4625,7 +4664,7 @@ test_stanza_instance (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -4658,7 +4697,7 @@ test_stanza_instance (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4677,7 +4716,7 @@ test_stanza_instance (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4707,7 +4746,7 @@ test_stanza_kill (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -4740,7 +4779,7 @@ test_stanza_kill (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -4772,7 +4811,7 @@ test_stanza_kill (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4791,7 +4830,7 @@ test_stanza_kill (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4810,7 +4849,7 @@ test_stanza_kill (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4829,7 +4868,7 @@ test_stanza_kill (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4848,7 +4887,7 @@ test_stanza_kill (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4867,7 +4906,7 @@ test_stanza_kill (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4886,7 +4925,7 @@ test_stanza_kill (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4906,7 +4945,7 @@ test_stanza_kill (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -4937,7 +4976,7 @@ test_stanza_normal (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -4976,7 +5015,7 @@ test_stanza_normal (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5015,7 +5054,7 @@ test_stanza_normal (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5059,7 +5098,7 @@ test_stanza_normal (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5100,7 +5139,7 @@ test_stanza_normal (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5119,7 +5158,7 @@ test_stanza_normal (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5138,7 +5177,7 @@ test_stanza_normal (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5157,7 +5196,7 @@ test_stanza_normal (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5176,7 +5215,7 @@ test_stanza_normal (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5195,7 +5234,7 @@ test_stanza_normal (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5225,7 +5264,7 @@ test_stanza_console (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5258,7 +5297,7 @@ test_stanza_console (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5291,7 +5330,7 @@ test_stanza_console (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5324,7 +5363,7 @@ test_stanza_console (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5355,7 +5394,7 @@ test_stanza_console (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5374,7 +5413,7 @@ test_stanza_console (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5392,7 +5431,7 @@ test_stanza_console (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5422,7 +5461,7 @@ test_stanza_env (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5460,7 +5499,7 @@ test_stanza_env (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5497,7 +5536,7 @@ test_stanza_env (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5516,7 +5555,7 @@ test_stanza_env (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5546,7 +5585,7 @@ test_stanza_export (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5583,7 +5622,7 @@ test_stanza_export (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5626,7 +5665,7 @@ test_stanza_export (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5668,7 +5707,7 @@ test_stanza_export (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5698,7 +5737,7 @@ test_stanza_umask (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5731,7 +5770,7 @@ test_stanza_umask (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5763,7 +5802,7 @@ test_stanza_umask (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5782,7 +5821,7 @@ test_stanza_umask (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5801,7 +5840,7 @@ test_stanza_umask (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5820,7 +5859,7 @@ test_stanza_umask (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5839,7 +5878,7 @@ test_stanza_umask (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5859,7 +5898,7 @@ test_stanza_umask (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -5889,7 +5928,7 @@ test_stanza_nice (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5922,7 +5961,7 @@ test_stanza_nice (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5955,7 +5994,7 @@ test_stanza_nice (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -5987,7 +6026,7 @@ test_stanza_nice (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -6006,7 +6045,7 @@ test_stanza_nice (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -6025,7 +6064,7 @@ test_stanza_nice (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -6044,7 +6083,7 @@ test_stanza_nice (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -6063,7 +6102,7 @@ test_stanza_nice (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -6082,7 +6121,7 @@ test_stanza_nice (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -6112,7 +6151,7 @@ test_stanza_oom (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6145,7 +6184,7 @@ test_stanza_oom (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6178,7 +6217,7 @@ test_stanza_oom (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6211,7 +6250,7 @@ test_stanza_oom (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6243,7 +6282,7 @@ test_stanza_oom (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -6262,7 +6301,7 @@ test_stanza_oom (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -6281,7 +6320,7 @@ test_stanza_oom (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -6300,7 +6339,7 @@ test_stanza_oom (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -6319,7 +6358,7 @@ test_stanza_oom (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -6338,7 +6377,7 @@ test_stanza_oom (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -6367,7 +6406,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6401,7 +6440,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6435,7 +6474,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6469,7 +6508,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6503,7 +6542,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6538,7 +6577,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6573,7 +6612,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6607,7 +6646,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6642,7 +6681,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6676,7 +6715,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6710,7 +6749,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6744,7 +6783,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6779,7 +6818,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6813,7 +6852,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6849,7 +6888,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6888,7 +6927,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6923,7 +6962,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6958,7 +6997,7 @@ test_stanza_limit (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -6992,7 +7031,7 @@ test_stanza_limit (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7011,7 +7050,7 @@ test_stanza_limit (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7030,7 +7069,7 @@ test_stanza_limit (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7049,7 +7088,7 @@ test_stanza_limit (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7068,7 +7107,7 @@ test_stanza_limit (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7087,7 +7126,7 @@ test_stanza_limit (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7106,7 +7145,7 @@ test_stanza_limit (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7125,7 +7164,7 @@ test_stanza_limit (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7144,7 +7183,7 @@ test_stanza_limit (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7163,7 +7202,7 @@ test_stanza_limit (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7182,7 +7221,7 @@ test_stanza_limit (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7212,7 +7251,7 @@ test_stanza_chroot (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -7246,7 +7285,7 @@ test_stanza_chroot (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -7279,7 +7318,7 @@ test_stanza_chroot (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7298,7 +7337,7 @@ test_stanza_chroot (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7328,7 +7367,7 @@ test_stanza_chdir (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -7362,7 +7401,7 @@ test_stanza_chdir (void)
+ 	TEST_ALLOC_FAIL {
+ 		pos = 0;
+ 		lineno = 1;
+-		job = parse_job (NULL, "test", buf, strlen (buf),
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
+ 				 &pos, &lineno);
+ 
+ 		if (test_alloc_failed) {
+@@ -7395,7 +7434,7 @@ test_stanza_chdir (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 
+@@ -7414,7 +7453,7 @@ test_stanza_chdir (void)
+ 
+ 	pos = 0;
+ 	lineno = 1;
+-	job = parse_job (NULL, "test", buf, strlen (buf), &pos, &lineno);
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
+ 
+ 	TEST_EQ_P (job, NULL);
+ 

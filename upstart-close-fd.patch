@@ -1,0 +1,23 @@
+diff --git a/init/job_process.c b/init/job_process.c
+index 8ce2f72..c2c96cb 100644
+--- a/init/job_process.c
++++ b/init/job_process.c
+@@ -298,6 +298,7 @@ job_process_run (Job         *job,
+ 
+ 	/* Feed the script to the child process */
+ 	if (shell) {
++		nih_local char *cmd = NULL;
+ 		NihIo *io;
+ 
+ 		/* Clean up and close the reading end (we don't need it) */
+@@ -317,6 +318,10 @@ job_process_run (Job         *job,
+ 			nih_free (err);
+ 		}
+ 
++		/* Close leaking fd first */
++		cmd = NIH_MUST (nih_sprintf (NULL, "<&%d- ;", fds[0]));
++		NIH_ZERO (nih_io_write (io, cmd, strlen (cmd)));
++
+ 		NIH_ZERO (nih_io_write (io, script, strlen (script)));
+ 		nih_io_shutdown (io);
+ 	}

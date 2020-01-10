@@ -1,0 +1,156 @@
+=== modified file 'ChangeLog'
+--- ChangeLog	2010-02-26 15:27:14 +0000
++++ ChangeLog	2010-02-26 15:29:07 +0000
+@@ -8,0 +9,8 @@
++2010-02-26  Scott James Remnant  <scott@netsplit.com>
++	* init/system.c (system_mount): Add function to mount a kernel
++	filesystem (ie. /proc and /sys)
++	* init/system.h: Add header.
++	* init/main.c: Mount /proc and /sys on
++	initialisation.
++
++
+
+=== modified file 'init/main.c'
+--- init/main.c	2010-02-04 19:14:30 +0000
++++ init/main.c	2010-02-26 15:29:07 +0000
+@@ -186,6 +186,28 @@
+ 	if (chdir ("/"))
+ 		nih_warn ("%s: %s", _("Unable to set root directory"),
+ 			  strerror (errno));
++
++	/* Mount the /proc and /sys filesystems, which are pretty much
++	 * essential for any Linux system; not to mention used by
++	 * ourselves.
++	 */
++	if (system_mount ("proc", "/proc") < 0) {
++		NihError *err;
++
++		err = nih_error_get ();
++		nih_warn ("%s: %s", _("Unable to mount /proc filesystem"),
++			  err->message);
++		nih_free (err);
++	}
++
++	if (system_mount ("sysfs", "/sys") < 0) {
++		NihError *err;
++
++		err = nih_error_get ();
++		nih_warn ("%s: %s", _("Unable to mount /sys filesystem"),
++			  err->message);
++		nih_free (err);
++	}
+ #else /* DEBUG */
+ 	nih_log_set_priority (NIH_LOG_DEBUG);
+ #endif /* DEBUG */
+
+=== modified file 'init/system.c'
+--- init/system.c	2009-06-23 09:29:35 +0000
++++ init/system.c	2010-02-26 15:29:07 +0000
+@@ -2,7 +2,7 @@
+  *
+  * system.c - core system functions
+  *
+- * Copyright © 2009 Canonical Ltd.
++ * Copyright © 2010 Canonical Ltd.
+  * Author: Scott James Remnant <scott@netsplit.com>.
+  *
+  * This program is free software; you can redistribute it and/or modify
+@@ -26,13 +26,17 @@
+ #include <sys/types.h>
+ #include <sys/ioctl.h>
+ #include <sys/stat.h>
++#include <sys/mount.h>
+ 
+ #include <fcntl.h>
+ #include <signal.h>
++#include <string.h>
+ #include <unistd.h>
+ #include <termios.h>
+ 
+ #include <nih/macros.h>
++#include <nih/alloc.h>
++#include <nih/string.h>
+ #include <nih/error.h>
+ #include <nih/logging.h>
+ 
+@@ -159,3 +163,56 @@
+ 
+ 	return 0;
+ }
++
++
++/**
++ * system_mount:
++ * @type: filesystem type,
++ * @dir: mountpoint.
++ *
++ * Mount the kernel filesystem @type at @dir, if not already mounted.  This
++ * is used to ensure that the proc and sysfs filesystems are always
++ * available.
++ *
++ * Filesystems are always mounted with the MS_NODEV, MS_NOEXEC and MS_NOSUID
++ * mount options, which are sensible for /proc and /sys.
++ *
++ * Returns: zero on success, negative value on raised error.
++ **/
++int
++system_mount (const char *type,
++	      const char *dir)
++{
++	nih_local char *parent = NULL;
++	char *          ptr;
++	struct stat     parent_stat;
++	struct stat     dir_stat;
++
++	nih_assert (type != NULL);
++	nih_assert (dir != NULL);
++
++	/* Stat the parent directory of the mountpoint to obtain the dev_t */
++	ptr = strrchr (dir, '/');
++	nih_assert (ptr != NULL);
++
++	parent = NIH_MUST (nih_strndup (NULL, dir, ptr == dir ? 1 : ptr - dir));
++	if (stat (parent, &parent_stat) < 0)
++		nih_return_system_error (-1);
++
++	/* Also stat the mountpoint to obtain the dev_t */
++	if (stat (dir, &dir_stat) < 0)
++		nih_return_system_error (-1);
++
++	/* If the two dev_ts do not match, then there is already a filesystem
++	 * mounted and we needn't do anything.
++	 */
++	if (parent_stat.st_dev != dir_stat.st_dev)
++		return 0;
++
++	/* Mount the filesystem */
++	if (mount ("none", dir, type,
++		   MS_NODEV | MS_NOEXEC | MS_NOSUID, NULL) < 0)
++		nih_return_system_error (-1);
++
++	return 0;
++}
+
+=== modified file 'init/system.h'
+--- init/system.h	2009-06-23 09:29:35 +0000
++++ init/system.h	2010-02-26 15:29:07 +0000
+@@ -1,6 +1,6 @@
+ /* upstart
+  *
+- * Copyright © 2009 Canonical Ltd.
++ * Copyright © 2010 Canonical Ltd.
+  * Author: Scott James Remnant <scott@netsplit.com>.
+  *
+  * This program is free software; you can redistribute it and/or modify
+@@ -35,6 +35,9 @@
+ int system_setup_console (ConsoleType type, int reset)
+ 	__attribute__ ((warn_unused_result));
+ 
++int system_mount         (const char *type, const char *dir)
++	__attribute__ ((warn_unused_result));
++
+ NIH_END_EXTERN
+ 
+ #endif /* INIT_SYSTEM_H */
+

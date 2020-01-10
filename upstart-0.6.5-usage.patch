@@ -1,0 +1,723 @@
+diff --git a/ChangeLog b/ChangeLog
+index b21926d..77db728 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,3 +1,11 @@
++2011-11-16  Petr Lautrbach <plautrba@redhat.com>
++	* init/parse_job.c, init/job_class.c, init/job_class.h: Added "usage"
++	stanza which is used by initctl command.
++	* init/tests/test_parse_job.c: Tests for "usage" stanza
++	* init/man/init.5: "usage" stanza documentation.
++	* util/initctl.c, util/man/initctl.8: Added "inictl usage" command.
++	* util/tests/test_initctl.c: Tests for ""inictl usage" command.
++
+ 2010-02-04  Scott James Remnant  <scott@netsplit.com>
+ 
+ 	* NEWS: Release 0.6.5
+diff --git a/contrib/vim/syntax/upstart.vim b/contrib/vim/syntax/upstart.vim
+index 6d43db8..e8be82b 100644
+--- a/contrib/vim/syntax/upstart.vim
++++ b/contrib/vim/syntax/upstart.vim
+@@ -33,6 +33,7 @@ syn cluster upstartShellCluster contains=@Shell
+ " one argument
+ syn keyword upstartStatement description author version
+ syn keyword upstartStatement pid kill normal console env umask nice limit chroot chdir exec
++syn keyword upstartStatement usage
+ 
+ " one or more arguments (events)
+ syn keyword upstartStatement emits
+diff --git a/dbus/com.ubuntu.Upstart.Job.xml b/dbus/com.ubuntu.Upstart.Job.xml
+index 27f47a1..db7f3dc 100644
+--- a/dbus/com.ubuntu.Upstart.Job.xml
++++ b/dbus/com.ubuntu.Upstart.Job.xml
+@@ -67,5 +67,6 @@
+     <property name="description" type="s" access="read" />
+     <property name="author" type="s" access="read" />
+     <property name="version" type="s" access="read" />
++    <property name="usage" type="s" access="read" />
+   </interface>
+ </node>
+diff --git a/init/job_class.c b/init/job_class.c
+index 1b8d1cf..3007744 100644
+--- a/init/job_class.c
++++ b/init/job_class.c
+@@ -222,6 +222,8 @@ job_class_new (const void *parent,
+ 
+ 	class->deleted = FALSE;
+ 
++	class->usage = NULL;
++
+ 	return class;
+ 
+ error:
+@@ -539,12 +541,23 @@ job_class_get_instance (JobClass        *class,
+ 	name = environ_expand (NULL, class->instance, instance_env);
+ 	if (! name) {
+ 		NihError *error;
++		char *error_message;
+ 
+ 		error = nih_error_get ();
+ 		if (error->number != ENOMEM) {
+ 			error = nih_error_steal ();
++			error_message = nih_strdup(NULL, error->message);
++			if (! error_message)
++				nih_return_system_error (-1);
++			if (class->usage) {
++				if (! nih_strcat_sprintf(&error_message, NULL, "\n%s: %s", _("Usage"), class->usage)) {
++					nih_return_system_error (-1);
++				}
++			}
++
+ 			nih_dbus_error_raise (DBUS_ERROR_INVALID_ARGS,
+-					      error->message);
++					      error_message);
++			nih_free (error_message);
+ 			nih_free (error);
+ 		}
+ 
+@@ -727,12 +740,22 @@ job_class_start (JobClass        *class,
+ 	name = environ_expand (NULL, class->instance, start_env);
+ 	if (! name) {
+ 		NihError *error;
++		char *error_message;
+ 
+ 		error = nih_error_get ();
+ 		if (error->number != ENOMEM) {
+ 			error = nih_error_steal ();
++			error_message = nih_strdup(NULL, error->message);
++			if (! error_message)
++				nih_return_system_error (-1);
++			if (class->usage) {
++				if (! nih_strcat_sprintf(&error_message, NULL, "\n%s: %s", _("Usage"), class->usage)) {
++					nih_return_system_error (-1);
++				}
++			}
+ 			nih_dbus_error_raise (DBUS_ERROR_INVALID_ARGS,
+-					      error->message);
++					      error_message);
++			nih_free (error_message);
+ 			nih_free (error);
+ 		}
+ 
+@@ -1162,3 +1185,40 @@ job_class_get_version (JobClass        *class,
+ 
+ 	return 0;
+ }
++
++/**
++ * job_class_get_usage:
++ * @class: class to obtain usage from,
++ * @message: D-Bus connection and message received,
++ * @usage: pointer for reply string.
++ *
++ * Implements the get method for the usage property of the
++ * com.ubuntu.Upstart.Job interface.
++ *
++ * Called to obtain the usage of the given @class
++ * which will be stored as an string in @usage.
++ *
++ * Returns: zero on success, negative value on raised error.
++ **/
++int
++job_class_get_usage (JobClass *      class,
++		     NihDBusMessage *message,
++		     char **        usage)
++{
++	nih_assert (class != NULL);
++	nih_assert (message != NULL);
++	nih_assert (usage != NULL);
++
++	if (class->usage) {
++		*usage = nih_strdup (message, class->usage);
++		}
++	else {
++		*usage = nih_strdup (message, "");
++	}
++
++	if (! *usage) {
++		nih_return_no_memory_error (-1);
++	}
++
++	return 0;
++}
+diff --git a/init/job_class.h b/init/job_class.h
+index 1d29c59..776f496 100644
+--- a/init/job_class.h
++++ b/init/job_class.h
+@@ -98,6 +98,7 @@ typedef enum console_type {
+  * @chroot: root directory of process (implies @chdir if not set),
+  * @chdir: working directory of process,
+  * @deleted: whether job should be deleted when finished.
++ * @usage: usage text - how to control job
+  *
+  * This structure holds the configuration of a known task or service that
+  * should be tracked by the init daemon; as tasks and services are
+@@ -148,6 +149,7 @@ typedef struct job_class {
+ 	char           *utmp_id;
+ 
+ 	int             deleted;
++	char           *usage;
+ } JobClass;
+ 
+ 
+@@ -219,6 +221,9 @@ int         job_class_get_version          (JobClass *class,
+ 					    NihDBusMessage *message,
+ 					    char **version)
+ 	__attribute__ ((warn_unused_result));
++int         job_class_get_usage	           (JobClass *class,
++					    NihDBusMessage *message,
++					    char **usage);
+ 
+ NIH_END_EXTERN
+ 
+diff --git a/init/man/init.5 b/init/man/init.5
+index 5260032..de722c3 100644
+--- a/init/man/init.5
++++ b/init/man/init.5
+@@ -482,6 +482,21 @@ daemon.
+ This stanza allows a job to document in its job configuration what events
+ it emits itself, and may be useful for graphing possible transitions.
+ .\"
++.TP
++.B usage \fIUSAGE
++This stanza may contain the text used by
++.BR initctl "(8) " usage
++command. This text may be also shown when commands
++.BR start (8),
++.BR stop (8)
++or
++.BR status (8)
++fail.
++
++.nf
++usage "tty DEV=ttyX - where X is console id"
++.fi
++.\"
+ .SS Process environment
+ Many common adjustments to the process environment, such as resource
+ limits, may be configured directly in the job rather than having to handle
+diff --git a/init/parse_job.c b/init/parse_job.c
+index 24aefb6..5849321 100644
+--- a/init/parse_job.c
++++ b/init/parse_job.c
+@@ -209,7 +209,10 @@ static int stanza_chdir       (JobClass *class, NihConfigStanza *stanza,
+ 			       const char *file, size_t len,
+ 			       size_t *pos, size_t *lineno)
+ 	__attribute__ ((warn_unused_result));
+-
++static int stanza_usage       (JobClass *class, NihConfigStanza *stanza,
++			       const char *file, size_t len,
++			       size_t *pos, size_t *lineno)
++	__attribute__ ((warn_unused_result));
+ 
+ /**
+  * stanzas:
+@@ -245,6 +248,7 @@ static NihConfigStanza stanzas[] = {
+ 	{ "limit",       (NihConfigHandler)stanza_limit       },
+ 	{ "chroot",      (NihConfigHandler)stanza_chroot      },
+ 	{ "chdir",       (NihConfigHandler)stanza_chdir       },
++	{ "usage",       (NihConfigHandler)stanza_usage       },
+ 
+ 	NIH_CONFIG_LAST
+ };
+@@ -2403,3 +2407,40 @@ stanza_chdir (JobClass        *class,
+ 
+ 	return nih_config_skip_comment (file, len, pos, lineno);
+ }
++
++/**
++ * stanza_usage:
++ * @class: job class being parsed,
++ * @stanza: stanza found,
++ * @file: file or string to parse,
++ * @len: length of @file,
++ * @pos: offset within @file,
++ * @lineno: line number.
++ *
++ * Parse a usage stanza from @file, extracting a single argument
++ * containing a usage message.
++ *
++ * Returns: zero on success, negative value on error.
++ **/
++static int
++stanza_usage (JobClass        *class,
++	      NihConfigStanza *stanza,
++	      const char      *file,
++	      size_t           len,
++	      size_t          *pos,
++	      size_t          *lineno)
++{
++	nih_assert (class != NULL);
++	nih_assert (stanza != NULL);
++	nih_assert (file != NULL);
++	nih_assert (pos != NULL);
++
++	if (class->usage)
++		nih_unref (class->usage, class);
++
++	class->usage = nih_config_next_arg (class, file, len, pos, lineno);
++	if (! class->usage)
++		return -1;
++
++	return nih_config_skip_comment (file, len, pos, lineno);
++}
+diff --git a/init/tests/test_parse_job.c b/init/tests/test_parse_job.c
+index 0290dff..235bada 100644
+--- a/init/tests/test_parse_job.c
++++ b/init/tests/test_parse_job.c
+@@ -7464,6 +7464,122 @@ test_stanza_chdir (void)
+ 	nih_free (err);
+ }
+ 
++void
++test_stanza_usage (void)
++{
++	JobClass*job;
++	NihError *err;
++	size_t    pos, lineno;
++	char      buf[1024];
++
++	TEST_FUNCTION ("stanza_usage");
++
++	/* Check that a usage stanza with an argument results in it
++	 * being stored in the job.
++	 */
++	TEST_FEATURE ("with single argument");
++	strcpy (buf, "usage \"stanza usage test message\"\n");
++
++	TEST_ALLOC_FAIL {
++		pos = 0;
++		lineno = 1;
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
++				 &pos, &lineno);
++
++		if (test_alloc_failed) {
++			TEST_EQ_P (job, NULL);
++
++			err = nih_error_get ();
++			TEST_EQ (err->number, ENOMEM);
++			nih_free (err);
++
++			continue;
++		}
++
++		TEST_EQ (pos, strlen (buf));
++		TEST_EQ (lineno, 2);
++
++		TEST_ALLOC_SIZE (job, sizeof (JobClass));
++
++		TEST_ALLOC_PARENT (job->usage, job);
++		TEST_EQ_STR (job->usage, "stanza usage test message");
++
++		nih_free (job);
++	}
++
++
++	/* Check that the last of multiple usage stanzas is used.
++	 */
++	TEST_FEATURE ("with multiple stanzas");
++	strcpy (buf, "usage \"stanza usage original\"\n");
++	strcat (buf, "usage \"stanza usage test message\"\n");
++
++	TEST_ALLOC_FAIL {
++		pos = 0;
++		lineno = 1;
++		job = parse_job (NULL, NULL, "test", buf, strlen (buf),
++				 &pos, &lineno);
++
++		if (test_alloc_failed) {
++			TEST_EQ_P (job, NULL);
++
++			err = nih_error_get ();
++			TEST_EQ (err->number, ENOMEM);
++			nih_free (err);
++
++			continue;
++		}
++
++		TEST_EQ (pos, strlen (buf));
++		TEST_EQ (lineno, 3);
++
++		TEST_ALLOC_SIZE (job, sizeof (JobClass));
++
++		TEST_ALLOC_PARENT (job->usage, job);
++		TEST_EQ_STR (job->usage, "stanza usage test message");
++
++		nih_free (job);
++	}
++
++
++	/* Check that a usage stanza without an argument results in
++	 * a syntax error.
++	 */
++	TEST_FEATURE ("with missing argument");
++	strcpy (buf, "usage\n");
++
++	pos = 0;
++	lineno = 1;
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
++
++	TEST_EQ_P (job, NULL);
++
++	err = nih_error_get ();
++	TEST_EQ (err->number, NIH_CONFIG_EXPECTED_TOKEN);
++	TEST_EQ (pos, 5);
++	TEST_EQ (lineno, 1);
++	nih_free (err);
++
++
++	/* Check that a usage stanza with an extra second argument
++	 * results in a syntax error.
++	 */
++	TEST_FEATURE ("with extra argument");
++	strcpy (buf, "usage stanza usage test message\n");
++
++	pos = 0;
++	lineno = 1;
++	job = parse_job (NULL, NULL, "test", buf, strlen (buf), &pos, &lineno);
++
++	TEST_EQ_P (job, NULL);
++
++	err = nih_error_get ();
++	TEST_EQ (err->number, NIH_CONFIG_UNEXPECTED_TOKEN);
++	TEST_EQ (pos, 13);
++	TEST_EQ (lineno, 1);
++	nih_free (err);
++}
++
+ int
+ main (int   argc,
+       char *argv[])
+@@ -7506,6 +7622,7 @@ main (int   argc,
+ 	test_stanza_limit ();
+ 	test_stanza_chroot ();
+ 	test_stanza_chdir ();
++	test_stanza_usage ();
+ 
+ 	return 0;
+ }
+diff --git a/util/initctl.c b/util/initctl.c
+index 58ccc42..bd6a038 100644
+--- a/util/initctl.c
++++ b/util/initctl.c
+@@ -56,6 +56,9 @@ NihDBusProxy *upstart_open (const void *parent)
+ char *        job_status   (const void *parent,
+ 			    NihDBusProxy *job_class, NihDBusProxy *job)
+ 	__attribute__ ((warn_unused_result, malloc));
++char *        job_usage    (const void *parent,
++			    NihDBusProxy *job_class)
++	__attribute__ ((warn_unused_result, malloc));
+ 
+ /* Prototypes for static functions */
+ static void   start_reply_handler (char **job_path, NihDBusMessage *message,
+@@ -75,6 +78,7 @@ int emit_action                 (NihCommand *command, char * const *args);
+ int reload_configuration_action (NihCommand *command, char * const *args);
+ int version_action              (NihCommand *command, char * const *args);
+ int log_priority_action         (NihCommand *command, char * const *args);
++int usage_action                (NihCommand *command, char * const *args);
+ 
+ 
+ /**
+@@ -310,6 +314,29 @@ job_status (const void *  parent,
+ 	return str;
+ }
+ 
++/**
++ * job_usage:
++ * @parent: parent object,
++ * @job_class_proxy: D-Bus proxy for job class,
++ * @job_class_name: Name of job class.
++ *
++ * Display usage of job class.
++ * 
++ * Returns: newly allocated string or NULL on raised error.
++ **/
++char *
++job_usage (const void *parent, NihDBusProxy *job_class_proxy)
++{
++	char             *usage = NULL;
++
++	nih_assert (job_class_proxy);
++
++	if (job_class_get_usage_sync (parent, job_class_proxy, &usage) < 0) {
++		return NULL;
++	}
++
++	return usage;
++}
+ 
+ /**
+  * start_action:
+@@ -1039,6 +1066,81 @@ error:
+ 	return 1;
+ }
+ 
++/**
++ * usage_action:
++ * @command: NihCommand invoked,
++ * @args: command-line arguments.
++ *
++ * This function is called for the "usage" command.
++ *
++ * Returns: command exit usage.
++ **/
++int
++usage_action (NihCommand *  command,
++	       char * const *args)
++{
++	nih_local NihDBusProxy *upstart = NULL;
++	const char *            upstart_job = NULL;
++	const char *            upstart_instance = NULL;
++	nih_local char *        job_class_name = NULL;
++	nih_local char *        job_class_path = NULL;
++	nih_local NihDBusProxy *job_class = NULL;
++	nih_local char *        job_path = NULL;
++	nih_local NihDBusProxy *job = NULL;
++	nih_local char *        usage = NULL;
++	NihError *              err;
++
++	nih_assert (command != NULL);
++	nih_assert (args != NULL);
++
++	if (args[0]) {
++		upstart_job = args[0];
++	} else {
++		upstart_job = getenv ("UPSTART_JOB");
++		upstart_instance = getenv ("UPSTART_INSTANCE");
++
++		if (! (upstart_job && upstart_instance)) {
++			fprintf (stderr, _("%s: missing job name\n"), program_name);
++			nih_main_suggest_help ();
++			return 1;
++		}
++	}
++
++	upstart = upstart_open (NULL);
++	if (! upstart)
++		return 1;
++
++	/* Obtain a proxy to the job */
++	if (upstart_get_job_by_name_sync (NULL, upstart, upstart_job,
++					  &job_class_path) < 0)
++		goto error;
++
++	job_class = nih_dbus_proxy_new (NULL, upstart->connection,
++					upstart->name, job_class_path,
++					NULL, NULL);
++	if (! job_class)
++		goto error;
++
++	job_class->auto_start = FALSE;
++
++	if (job_class_get_name_sync (NULL, job_class, &job_class_name) < 0)
++		goto error;
++
++	usage = job_usage (NULL, job_class);
++	if (! usage)
++		goto error;
++
++	nih_message ("%s: %s", _("Usage"), usage);
++
++	return 0;
++
++error:
++	err = nih_error_get ();
++	nih_error ("%s", err->message);
++	nih_free (err);
++
++	return 1;
++}
+ 
+ /**
+  * emit_action:
+@@ -1369,6 +1471,16 @@ NihOption log_priority_options[] = {
+ 	NIH_OPTION_LAST
+ };
+ 
++/**
++ *  * usage_options:
++ *   *
++ *    * Command-line options accepted for the usage command.
++ *     **/
++NihOption usage_options[] = {
++        NIH_OPTION_LAST
++};
++
++
+ 
+ /**
+  * job_group:
+@@ -1478,6 +1590,11 @@ static NihCommand commands[] = {
+ 	     "Without arguments, this outputs the current log priority."),
+ 	  NULL, log_priority_options, log_priority_action },
+ 
++	{ "usage",  N_("JOB"),
++	  N_("Show job usage message if available."),
++	  N_("JOB is the name of the job which usage is to be shown.\n" ),
++	  NULL, usage_options, usage_action },
++
+ 	NIH_COMMAND_LAST
+ };
+ 
+diff --git a/util/man/initctl.8 b/util/man/initctl.8
+index 1e88558..4f7262b 100644
+--- a/util/man/initctl.8
++++ b/util/man/initctl.8
+@@ -338,6 +338,29 @@ When called without argument, it requests the current minimum message
+ priority that the
+ .BR init (8)
+ daemon will log and ouputs to standard output.
++
++.RE
++.\"
++.TP
++.B usage
++.I JOB
++.RI [ KEY=VALUE ]...
++
++Show usage information an instance of the named
++.IR JOB
++defined with
++.BR usage
++stanza.
++
++For job with
++.BR usage
++stanza a line like the following is output, see
++.BR init (5)
++:
++
++.nf
++  Usage: tty DEV=ttyX - where X is console id
++.fi
+ .\"
+ .SH AUTHOR
+ Written by Scott James Remnant
+diff --git a/util/tests/test_initctl.c b/util/tests/test_initctl.c
+index 54ead53..4736a68 100644
+--- a/util/tests/test_initctl.c
++++ b/util/tests/test_initctl.c
+@@ -65,6 +65,7 @@ extern int emit_action                 (NihCommand *command, char * const *args)
+ extern int reload_configuration_action (NihCommand *command, char * const *args);
+ extern int version_action              (NihCommand *command, char * const *args);
+ extern int log_priority_action         (NihCommand *command, char * const *args);
++extern int usage_action                (NihCommand *command, char * const *args);
+ 
+ 
+ static int my_connect_handler_called = FALSE;
+@@ -13282,6 +13283,105 @@ test_log_priority_action (void)
+ 	dbus_shutdown ();
+ }
+ 
++#if 0
++void
++test_usage (void)
++{
++	char             dirname[PATH_MAX];
++	nih_local char  *cmd;
++	pid_t            upstart_pid = 0;
++	pid_t            dbus_pid    = 0;
++	char           **output;
++	size_t           lines;
++	FILE            *out;
++	FILE            *err;
++	NihCommand       command;
++	char            *args[2];
++	int              ret = 0;
++
++	TEST_GROUP ("usage");
++
++        TEST_FILENAME (dirname);
++        TEST_EQ (mkdir (dirname, 0755), 0);
++
++	/* Use the "secret" interface */
++	TEST_EQ (setenv ("UPSTART_CONFDIR", dirname, 1), 0);
++
++	TEST_DBUS (dbus_pid);
++	START_UPSTART (upstart_pid);
++
++	TEST_FEATURE ("no usage");
++	CREATE_FILE (dirname, "foo.conf",
++			"author \"foo\"\n"
++			"description \"wibble\"");
++
++	cmd = nih_sprintf (NULL, "%s usage foo 2>&1", INITCTL_BINARY);
++	TEST_NE_P (cmd, NULL);
++	RUN_COMMAND (NULL, cmd, &output, &lines);
++	TEST_EQ_STR (output[0], "Usage: ");
++	TEST_EQ (lines, 1);
++	nih_free (output);
++
++	DELETE_FILE (dirname, "foo.conf");
++
++	/*******************************************************************/
++
++	TEST_FEATURE ("with usage");
++
++	CREATE_FILE (dirname, "foo.conf",
++			"usage \"this is usage\"");
++
++	cmd = nih_sprintf (NULL, "%s usage foo 2>&1", INITCTL_BINARY);
++	TEST_NE_P (cmd, NULL);
++	RUN_COMMAND (NULL, cmd, &output, &lines);
++	TEST_EQ_STR (output[0], "Usage: this is usage");
++	TEST_EQ (lines, 1);
++	nih_free (output);
++
++	DELETE_FILE (dirname, "foo.conf");
++
++	/*******************************************************************/
++
++	TEST_FEATURE ("failed status with usage");
++
++	CREATE_FILE (dirname, "foo.conf",
++			"instance $FOO\n"
++			"usage \"this is usage\"");
++
++	memset (&command, 0, sizeof command);
++	args[0] = "foo";
++	args[1] = NULL;
++
++	out = tmpfile ();
++	err = tmpfile ();
++
++	TEST_DIVERT_STDOUT (out) {
++		TEST_DIVERT_STDERR (err) {
++			ret = status_action (&command, args);
++		}
++	}
++	rewind (out);
++	rewind (err);
++
++	TEST_GT (ret, 0);
++
++	TEST_FILE_END (out);
++	TEST_FILE_RESET (out);
++
++	TEST_FILE_EQ (err, "test: Unknown parameter: FOO\n");
++	TEST_FILE_EQ (err, "Usage: this is usage\n");
++	TEST_FILE_END (err);
++	TEST_FILE_RESET (err);
++
++	DELETE_FILE (dirname, "foo.conf");
++
++
++	STOP_UPSTART (upstart_pid);
++	TEST_EQ (unsetenv ("UPSTART_CONFDIR"), 0);
++	TEST_DBUS_END (dbus_pid);
++}
++#endif
++
+ 
+ int
+ main (int   argc,
+@@ -13307,6 +13407,9 @@ main (int   argc,
+ 	test_reload_configuration_action ();
+ 	test_version_action ();
+ 	test_log_priority_action ();
++#if 0
++	test_usage ();
++#endif
+ 
+ 	return 0;
+ }

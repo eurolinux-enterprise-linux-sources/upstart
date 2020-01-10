@@ -1,0 +1,13 @@
+diff --git a/util/telinit.c b/util/telinit.c
+index e51375d..16efcbc 100644
+--- a/util/telinit.c
++++ b/util/telinit.c
+@@ -107,7 +107,7 @@ main (int   argc,
+ {
+ 	char **args;
+ 	int    runlevel;
+-	int    ret;
++	int    ret = 0;
+ 
+ 	nih_main_init (argv[0]);
+ 
