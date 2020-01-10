@@ -1,15 +1,3 @@
-diff -up ./configure.audit.old ./configure.audit
---- ./configure.audit.old	2012-02-02 12:02:07.598042579 +0100
-+++ ./configure.audit	2012-02-02 12:13:03.263845628 +0100
-@@ -705,7 +705,7 @@ PACKAGE_NAME='upstart'
- PACKAGE_TARNAME='upstart'
- PACKAGE_VERSION='0.6.5'
- PACKAGE_STRING='upstart 0.6.5'
--PACKAGE_BUGREPORT='upstart-devel@lists.ubuntu.com'
-+PACKAGE_BUGREPORT='https://launchpad.net/upstart/+bugs'
- PACKAGE_URL=''
- 
- ac_unique_file="init/main.c"
 diff -up ./configure.old ./configure
 --- ./configure.old	2012-02-02 12:01:56.013187409 +0100
 +++ ./configure	2012-02-02 12:13:04.348832064 +0100

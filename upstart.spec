@@ -1,6 +1,6 @@
 Name:           upstart
 Version:        0.6.5
-Release:        13%{?dist}.3
+Release:        16%{?dist}
 Summary:        An event-driven init system
 
 Group:          System Environment/Base
@@ -8,6 +8,7 @@ License:        GPLv2 and LGPLv2+
 URL:            http://upstart.ubuntu.com
 Source0:        http://upstart.ubuntu.com/download/0.6/upstart-%{version}.tar.gz
 Source1:        init-system-dbus.conf
+Source2:        init.conf
 Patch1:         upstart-telinit.patch
 Patch2:         upstart-audit-events.patch
 # set DEAD_PROCESS for died proccess with pid in utmp table (#556731, #633216)
@@ -36,7 +37,7 @@ Patch13:        upstart-0.6.5-console.patch
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 Obsoletes: SysVinit < 2.86-24, sysvinit < 2.86-24
 Provides: SysVinit = 2.86-24, sysvinit = 2.86-24
-BuildRequires:  gettext, audit-libs-devel, expat-devel 
+BuildRequires:  gettext, audit-libs-devel, expat-devel
 BuildRequires:  dbus-devel >= 1:1.2.16, libnih-devel >= 1.0.1
 
 %description
@@ -74,6 +75,7 @@ make install DESTDIR=%{buildroot}
 # don't ship default jobs
 rm -f %{buildroot}/%{_sysconfdir}/init/*
 install -m 644 %{SOURCE1} %{buildroot}/%{_sysconfdir}/init/
+install -m 644 %{SOURCE2} %{buildroot}/%{_sysconfdir}/init.conf
 
 %find_lang %{name}
 
@@ -96,6 +98,7 @@ rm -rf %{buildroot}
 %doc TODO
 %doc HACKING
 %{_sysconfdir}/init/
+%config(noreplace) %{_sysconfdir}/init.conf
 %config(noreplace) %{_sysconfdir}/dbus-1/system.d/Upstart.conf
 /sbin/halt
 /sbin/init
@@ -137,13 +140,15 @@ rm -rf %{buildroot}
 %{_mandir}/man8/reload.8.gz
 
 %changelog
-* Thu Mar 06 2014 Lukáš Nykrýn <lnykryn@redhat.com> - 0.6.5-13.3
+* Wed Dec 16 2015 Lukáš Nykrýn <lnykryn@redhat.com> - 0.6.5-16
+- add /etc/init.conf file
+- fix bugreport patch
+
+* Tue Feb 18 2014 Lukáš Nykrýn <lnykryn@redhat.com> - 0.6.5-15
+- fix issue with multiple nih_error_raise calls in previous patch
 - reset console only for console owners (#1046190)
 
-* Tue Feb 18 2014 Lukáš Nykrýn <lnykryn@redhat.com> - 0.6.5-13.2
-- fix issue with multiple nih_error_raise calls in previous patch
-
-* Fri Feb 07 2014 Lukáš Nykrýn <lnykryn@redhat.com> - 0.6.5-13.1
+* Fri Feb 07 2014 Lukáš Nykrýn <lnykryn@redhat.com> - 0.6.5-14
 - handle open failures on the system console and null
 
 * Mon May 27 2013 Lukas Nykryn <lnykryn@redhat.com> - 0.6.5-13
