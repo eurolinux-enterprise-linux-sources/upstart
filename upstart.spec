@@ -1,6 +1,6 @@
 Name:           upstart
 Version:        0.6.5
-Release:        13%{?dist}.2
+Release:        13%{?dist}.3
 Summary:        An event-driven init system
 
 Group:          System Environment/Base
@@ -137,6 +137,9 @@ rm -rf %{buildroot}
 %{_mandir}/man8/reload.8.gz
 
 %changelog
+* Thu Mar 06 2014 Lukáš Nykrýn <lnykryn@redhat.com> - 0.6.5-13.3
+- reset console only for console owners (#1046190)
+
 * Tue Feb 18 2014 Lukáš Nykrýn <lnykryn@redhat.com> - 0.6.5-13.2
 - fix issue with multiple nih_error_raise calls in previous patch
 

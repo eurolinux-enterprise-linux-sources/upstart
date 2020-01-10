@@ -1,12 +1,16 @@
 diff --git a/init/system.c b/init/system.c
-index 9490689..41a006b 100644
+index e3fe260..3fa8430 100644
 --- a/init/system.c
 +++ b/init/system.c
-@@ -111,6 +111,7 @@ system_setup_console (ConsoleType type,
+@@ -113,8 +113,10 @@ system_setup_console (ConsoleType type,
+ 		if (fd < 0)
+ 			nih_return_system_error (-1);
  
- 		if (type == CONSOLE_OWNER)
+-		if (type == CONSOLE_OWNER)
++		if (type == CONSOLE_OWNER) {
  			ioctl (fd, TIOCSCTTY, 1);
-+		reset = 1;
++		        reset = 1;
++                }
  		break;
  	case CONSOLE_NONE:
  		/* No console really means /dev/null */
