@@ -1,6 +1,6 @@
 Name:           upstart
 Version:        0.6.5
-Release:        16%{?dist}
+Release:        17%{?dist}
 Summary:        An event-driven init system
 
 Group:          System Environment/Base
@@ -33,6 +33,8 @@ Patch11:        upstart-0.6.5-mount.patch
 Patch12:        upstart-0.6.5-echo.patch
 # https://bugzilla.redhat.com/show_bug.cgi?id=1016124
 Patch13:        upstart-0.6.5-console.patch
+#https://bugzilla.redhat.com/show_bug.cgi?id=1380858
+Patch14:        upstart-0.6.5-double-unref.patch
 
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 Obsoletes: SysVinit < 2.86-24, sysvinit < 2.86-24
@@ -60,6 +62,7 @@ during shutdown and supervising them while the system is running.
 %patch11 -p0 -b .mount
 %patch12 -p1 -b .echo
 %patch13 -p1 -b .console
+%patch14 -p1 -b .unref
 
 
 %build
@@ -140,6 +143,9 @@ rm -rf %{buildroot}
 %{_mandir}/man8/reload.8.gz
 
 %changelog
+* Thu Feb 08 2018 Lukas Nykryn <lnykryn@redhat.com> - 0.6.5-17
+- fix double unref
+
 * Wed Dec 16 2015 Lukáš Nykrýn <lnykryn@redhat.com> - 0.6.5-16
 - add /etc/init.conf file
 - fix bugreport patch

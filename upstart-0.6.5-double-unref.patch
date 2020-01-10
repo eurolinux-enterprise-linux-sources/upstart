@@ -1,0 +1,13 @@
+diff --git a/init/conf.c b/init/conf.c
+index 215effa..88f13b8 100644
+--- a/init/conf.c
++++ b/init/conf.c
+@@ -771,6 +771,8 @@ error:
+ 				_("Error while loading configuration file"),
+ 				err->message);
+ 		nih_free (err);
++
++		file = (ConfFile *)nih_hash_lookup (source->files, new_path);
+ 		if (file)
+ 			nih_unref (file, source);
+ 	}
